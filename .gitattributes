@@ -1,0 +1,15 @@
+# This is a Windows-only tool, and cmd.exe is the fussiest consumer here:
+# a .bat with bare LF line endings can misbehave around labels and goto.
+# Normalise everything to CRLF on checkout so a clone is always runnable.
+* text=auto eol=crlf
+
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Documentation reads fine either way; keep it LF so diffs stay clean on
+# non-Windows clients browsing the repo.
+*.md   text eol=lf
+LICENSE text eol=lf
+.gitattributes text eol=lf
+.gitignore     text eol=lf

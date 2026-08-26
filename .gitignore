@@ -1,0 +1,21 @@
+# The user's own reinstall script is environment-specific and often contains
+# internal server names. The .example version is what ships.
+ClientReinstall.ps1
+
+# Transcripts, reports and backups produced by a local run
+*.log
+*.lo_
+*.cmtrace.log
+Logs/
+Backups/
+*.json
+!.vscode/*.json
+
+# Windows / editor noise
+Thumbs.db
+desktop.ini
+.DS_Store
+*.swp
+*~
+.vscode/
+.idea/
