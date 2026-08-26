@@ -76,9 +76,9 @@ $script:MDErrorCatalog = @{
     '0x80200014' = @{ Name = 'BG_E_MISSING_FILE_SIZE';       Area = 'Content';  Means = 'The server did not return a content length - a proxy or WAF is rewriting the response.'; Fix = 'Bypass the intercepting proxy for DP traffic.' }
 
     # -- Certificates / registration ----------------------------------------
-    '0x80090016' = @{ Name = 'NTE_BAD_KEYSET';               Area = 'Certificates'; Means = 'The private key for the client certificate is missing or unreadable by SYSTEM.'; Fix = 'Re-register the client (mecmdoctor repair -Level Standard) so it regenerates its self-signed cert.' }
-    '0x8009000B' = @{ Name = 'NTE_BAD_KEY_STATE';            Area = 'Certificates'; Means = 'The key exists but is not usable in its current state - damaged MachineKeys ACLs are the usual cause.'; Fix = 'Check permissions on C:\ProgramData\Microsoft\Crypto\RSA\MachineKeys, then re-register.' }
-    '0x80092004' = @{ Name = 'CRYPT_E_NOT_FOUND';            Area = 'Certificates'; Means = 'A required certificate could not be found in the store.'; Fix = 'Check the SMS certificate store; re-register the client to reissue the self-signed certificate.' }
+    '0x80090016' = @{ Name = 'NTE_BAD_KEYSET';               Area = 'Certificates'; Means = 'The private key for the client certificate is missing or unreadable by SYSTEM.'; Fix = 'Check ACLs on C:\ProgramData\Microsoft\Crypto\RSA\MachineKeys, then restart CcmExec so the client reissues its self-signed certificate.' }
+    '0x8009000B' = @{ Name = 'NTE_BAD_KEY_STATE';            Area = 'Certificates'; Means = 'The key exists but is not usable in its current state - damaged MachineKeys ACLs are the usual cause.'; Fix = 'Check permissions on C:\ProgramData\Microsoft\Crypto\RSA\MachineKeys, then restart CcmExec.' }
+    '0x80092004' = @{ Name = 'CRYPT_E_NOT_FOUND';            Area = 'Certificates'; Means = 'A required certificate could not be found in the store.'; Fix = 'Check the SMS certificate store, then restart CcmExec so the client reissues its self-signed certificate.' }
     '0x800B0109' = @{ Name = 'CERT_E_UNTRUSTEDROOT';         Area = 'Certificates'; Means = 'The certificate chains to a root the client does not trust.'; Fix = 'Ensure the issuing CA root is in Trusted Root Certification Authorities on the client.' }
     '0x800B0101' = @{ Name = 'CERT_E_EXPIRED';               Area = 'Certificates'; Means = 'The certificate has expired (or the clock is wrong and it looks expired).'; Fix = 'Renew the certificate and verify system time.' }
 
@@ -137,11 +137,11 @@ $script:MDPatternCatalog = @(
 
     @{ Match = 'Failed to submit registration request'; Log = $null; Area = 'Registration';
        Means = 'Client registration never completed, so the client has no valid identity with the site.';
-       Fix   = 'Re-register the client: mecmdoctor repair -Level Standard' }
+       Fix   = 'Restart CcmExec so registration is retried, then read ClientIDManagerStartup.log: mecmdoctor repair -Level Safe' }
 
     @{ Match = 'Client is not registered|Registration is not complete|Unable to (find|retrieve) the client (GUID|certificate)'; Log = $null; Area = 'Registration';
        Means = 'The client has no completed registration with the site.';
-       Fix   = 'Re-register the client (drops SMSCFG.INI and the SMS certificates, then restarts CcmExec).' }
+       Fix   = 'Restart CcmExec and let the client complete registration under its existing identity, then check CcmMessaging.log for what the MP rejected.' }
 
     @{ Match = 'Failed to (find|get) MP location|No (MP|management point) found|LSGetMPLocations? failed'; Log = $null; Area = 'Registration';
        Means = 'Management point lookup failed - the client does not know where to send anything.';

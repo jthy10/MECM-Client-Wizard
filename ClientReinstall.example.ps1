@@ -33,6 +33,17 @@
        ccmsetup.exe returns as soon as it has handed off to its background
        service. This script waits for the actual install to finish, which is
        almost always what you want.
+
+     CLIENT IDENTITY
+       Removing SMSCFG.INI below is part of a full uninstall, and a reinstalled
+       client registers with a NEW client GUID - the device's inventory and
+       deployment history in the console is orphaned. That is inherent to
+       reinstalling, which is why it is its own explicit command: no mecmdoctor
+       repair resets the client identity, and none can escalate into this.
+
+       If you would rather keep the existing identity, drop SMSCFG.INI from the
+       $leftovers list below and let the client re-register with the GUID it
+       already has.
     ===========================================================================
 #>
 

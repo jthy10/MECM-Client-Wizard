@@ -28,7 +28,6 @@ $script:MDRepairIds = @{
     WmiReset          = 'wmi.reset'             # winmgmt /resetrepository  (destructive)
     PolicyReset       = 'policy.reset'          # SMS_Client.ResetPolicy(1) - purge + redownload
     PolicyTrigger     = 'policy.trigger'        # kick the machine policy schedules
-    Reregister        = 'client.reregister'     # drop SMSCFG.INI + SMS certs, re-register
     ClientRepair      = 'client.repair'         # ccmrepair.exe / SMS_Client.RepairClient
     ClientReinstall   = 'client.reinstall'      # full uninstall + reinstall  (destructive)
     CacheClear        = 'cache.clear'           # purge the CCM content cache
@@ -176,13 +175,79 @@ function Get-MDHostFacts {
         $facts['OS']       = 'unavailable (WMI query failed): ' + $_.Exception.Message
     }
 
-    $facts['User context']  = '{0}\{1}' -f $env:USERDOMAIN, $env:USERNAME
-    $facts['Elevated']      = if (Test-MDAdmin) { 'yes' } else { 'NO - most checks and all repairs need admin' }
-    $facts['PowerShell']    = $PSVersionTable.PSVersion.ToString()
-    $facts['Architecture']  = $env:PROCESSOR_ARCHITECTURE
-    $facts['Started']       = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss K')
+    $facts['Windows release'] = (Get-MDWindowsRelease).Text
+    $facts['User context']    = '{0}\{1}' -f $env:USERDOMAIN, $env:USERNAME
+    $facts['Elevated']        = if (Test-MDAdmin) { 'yes' } else { 'NO - most checks and all repairs need admin' }
+    $facts['PowerShell']      = $PSVersionTable.PSVersion.ToString()
+    $facts['Architecture']    = $env:PROCESSOR_ARCHITECTURE
+    $facts['Started']         = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss K')
 
     $facts
+}
+
+
+function Get-MDWindowsRelease {
+<#
+    .SYNOPSIS
+        Identifies the Windows release precisely enough to pick the right
+        policy semantics for it.
+    .DESCRIPTION
+        Several Windows Update policies were replaced outright at specific
+        builds, so "is this Windows 11" is not a detail - it decides whether a
+        missing registry value is a misconfiguration or simply not applicable.
+
+        Read from the registry rather than Win32_OperatingSystem: this has to
+        keep working on a machine whose WMI repository is the thing that is
+        broken.
+    .OUTPUTS
+        [pscustomobject] Build / Caption / DisplayVersion / IsServer /
+        IsWindows11 / Name
+#>
+    [CmdletBinding()]
+    param()
+
+    $cv = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+
+    $build = 0
+    $raw   = Get-MDRegValue -Path $cv -Name 'CurrentBuildNumber'
+    if ($raw) { [void][int]::TryParse("$raw", [ref]$build) }
+    if ($build -le 0) {
+        try { $build = [Environment]::OSVersion.Version.Build } catch { $build = 0 }
+    }
+
+    # UBR is the fourth part of the full build string (10.0.22631.4317).
+    $ubr = Get-MDRegValue -Path $cv -Name 'UBR'
+
+    $caption = Get-MDRegValue -Path $cv -Name 'ProductName'
+    if (-not $caption) { $caption = 'Windows' }
+
+    # DisplayVersion (22H2) replaced ReleaseId (2009) at Windows 10 20H2.
+    $display = Get-MDRegValue -Path $cv -Name 'DisplayVersion'
+    if (-not $display) { $display = Get-MDRegValue -Path $cv -Name 'ReleaseId' }
+
+    $installType = Get-MDRegValue -Path $cv -Name 'InstallationType'
+    $isServer    = ("$installType" -match '(?i)server')
+
+    # Windows 11 kept ProductName as "Windows 10" for its whole first year, so
+    # the build number is the only trustworthy discriminator.
+    $isWin11 = (-not $isServer) -and ($build -ge 22000)
+
+    $name = $caption
+    if ($isWin11 -and $caption -notmatch '11') { $name = $caption -replace '10', '11' }
+
+    $full = "$build"
+    if ($ubr) { $full = '{0}.{1}' -f $build, $ubr }
+
+    [pscustomobject]@{
+        Build          = $build
+        BuildFull      = $full
+        Caption        = $caption
+        Name           = $name
+        DisplayVersion = $display
+        IsServer       = $isServer
+        IsWindows11    = $isWin11
+        Text           = ('{0}{1} (build {2})' -f $name, $(if ($display) { " $display" } else { '' }), $full)
+    }
 }
 
 

@@ -142,12 +142,14 @@ function Write-MDSummary {
         Write-MDLine '  Nothing to repair.' -Color 'Green'
     }
     else {
-        Write-MDLine ('  mecmdoctor repair -Level {0}' -f $recommended) -Color 'Cyan'
+        Write-MDLine '  mecmdoctor repair' -Color 'Cyan'
         Write-MDLine ''
-        Write-MDDetail -Text ('This will run {0} targeted repair action(s): {1}' -f $repairIds.Count, ($repairIds -join ', ')) -Indent 4
-        Write-MDDetail -Text 'Add -DryRun first to see exactly what would happen without changing anything.' -Indent 4
+        Write-MDDetail -Text ('The diagnosis recommends the {0} tier, which is what repair uses unless you pass -Level yourself.' -f $recommended) -Indent 4
+        Write-MDDetail -Text ('It would run {0} targeted repair action(s): {1}' -f $repairIds.Count, ($repairIds -join ', ')) -Indent 4
+        Write-MDDetail -Text 'repair explains why each action is in the plan and asks before it changes anything.' -Indent 4
+        Write-MDDetail -Text 'Add -DryRun to see exactly what would happen without changing anything.' -Indent 4
         if ($recommended -eq 'Aggressive') {
-            Write-MDDetail -Text 'Aggressive actions are destructive and will prompt before running. Add -Force only in an unattended run you have already validated.' -Indent 4 -Color 'DarkYellow'
+            Write-MDDetail -Text 'This plan includes destructive actions. Each one warns and asks for its own confirmation before running. Add -Force only in an unattended run you have already validated.' -Indent 4 -Color 'DarkYellow'
         }
     }
 
@@ -160,6 +162,80 @@ function Write-MDSummary {
         Issues      = $issues.Count
         RepairIds   = $repairIds
         Recommended = $recommended
+    }
+}
+
+
+function Write-MDRepairRationale {
+<#
+    .SYNOPSIS
+        Prints the repair plan together with the reason each action is in it.
+    .DESCRIPTION
+        A list of action ids tells an operator what is about to happen but not
+        why, which is exactly the information needed to decide whether to say
+        yes. Every planned action is matched back to the findings that named
+        it, so "wmi.salvage" reads as "because the repository verifies as
+        inconsistent" rather than as a bare identifier.
+
+        Actions with no matching finding are labelled as such - that is what
+        -All and -Only produce, and it is worth seeing plainly.
+#>
+    param(
+        [Parameter(Mandatory)] $Plan,
+        $Findings,
+        $Context
+    )
+
+    $plan = @($Plan)
+    $all  = @($Findings)
+
+    $rows = foreach ($p in $plan) {
+        [pscustomobject]@{
+            Order = $p.Order
+            Id    = $p.Id
+            Tier  = $p.Level
+            Why   = @($all | Where-Object { $_.Status -in @('Warn', 'Fail') -and $_.RepairIds -contains $p.Id }).Count
+        }
+    }
+
+    Write-MDTable -Rows $rows -Indent 2 -Columns @(
+        @{ Header = '#';          Property = 'Order'; Width = 4 }
+        @{ Header = 'ACTION ID';  Property = 'Id';    Width = 24 }
+        @{ Header = 'TIER';       Property = 'Tier';  Width = 12 }
+        @{ Header = 'FINDINGS';   Property = 'Why';   Width = 8 }
+    ) -RowColor {
+        param($r)
+        switch ($r.Tier) { 'Aggressive' { 'Red' } 'Standard' { 'Yellow' } default { 'Gray' } }
+    }
+
+    Write-MDLine ''
+    Write-MDLine '  Why each action is in the plan:' -Color 'White'
+
+    foreach ($p in $plan) {
+        $reasons = @($all | Where-Object { $_.Status -in @('Warn', 'Fail') -and $_.RepairIds -contains $p.Id })
+
+        Write-MDLine ''
+        Write-MDLine ('  {0}  [{1}]' -f $p.Id, $p.Level) -Color 'Cyan'
+
+        if ($reasons.Count -eq 0) {
+            Write-MDDetail -Indent 6 -Bullet '- ' -Color 'DarkYellow' `
+                -Text 'No finding asked for this. It is in the plan because -All or -Only put it there.'
+            continue
+        }
+
+        foreach ($r in ($reasons | Sort-Object -Property @{ Expression = { $_.Severity }; Descending = $true } | Select-Object -First 5)) {
+            Write-MDDetail -Indent 6 -Bullet '- ' -Text ('{0}: {1} -- {2}' -f $r.Category, $r.Title, $r.Detail)
+        }
+        if ($reasons.Count -gt 5) {
+            Write-MDDetail -Indent 6 -Bullet '- ' -Text ('and {0} more finding(s)' -f ($reasons.Count - 5))
+        }
+
+        # services.fix is the one action whose scope is not obvious from its id.
+        if ($Context -and $p.Id -eq $script:MDRepairIds.ServicesFix) {
+            $targets = @(Get-MDServiceRepairTargets -Names $Context.TargetServices | ForEach-Object { $_.Name })
+            Write-MDDetail -Indent 6 -Bullet '> ' -Color 'DarkCyan' `
+                -Text ('will touch only: {0}' -f ($targets -join ', '))
+        }
     }
 }
 

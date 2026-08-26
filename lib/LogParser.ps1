@@ -517,12 +517,12 @@ function Invoke-MDLogReport {
         $repairIds = @()
         foreach ($i in $issues) {
             switch ($i.LogArea) {
-                'Registration' { $repairIds += $script:MDRepairIds.Reregister }
+                'Registration' { $repairIds += $script:MDRepairIds.CcmRestart;   $repairIds += $script:MDRepairIds.PolicyTrigger }
                 'Policy'       { $repairIds += $script:MDRepairIds.PolicyReset }
                 'Updates'      { $repairIds += $script:MDRepairIds.UpdatesReset; $repairIds += $script:MDRepairIds.UpdatesRescan }
                 'Content'      { $repairIds += $script:MDRepairIds.CacheClear;   $repairIds += $script:MDRepairIds.BitsClear }
                 'WMI'          { $repairIds += $script:MDRepairIds.WmiSalvage }
-                'Certificates' { $repairIds += $script:MDRepairIds.Reregister }
+                'Certificates' { $repairIds += $script:MDRepairIds.CcmRestart }
             }
         }
 

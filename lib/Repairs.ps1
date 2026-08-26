@@ -11,9 +11,9 @@
                    middle of the day.
 
        Standard    Rebuilds client-side state that Windows or the client will
-                   regenerate: the WMI repository salvage, policy purge, client
-                   re-registration, Windows Update datastore, corrupt local
-                   Group Policy files. Default level.
+                   regenerate: the WMI repository salvage, policy purge,
+                   Windows Update datastore, corrupt local Group Policy files.
+                   Default level.
 
        Aggressive  Destructive. Resets the WMI repository outright, clears
                    Group Policy state, rebuilds the security database, or
@@ -24,6 +24,17 @@
        * honours -DryRun (shows what it would do, changes nothing)
        * backs up anything it deletes into the backup folder for the run
        * returns a result object rather than throwing
+
+     Two things this file deliberately does not contain:
+
+       * any action that resets the client identity. Deleting SMSCFG.INI or
+         the SMS certificate store gives the device a new client GUID and
+         orphans its whole history in the console. The client re-registers
+         under the identity it already has when CcmExec restarts, which is
+         what ccmexec.restart does.
+       * any path that resets the WMI repository on weak evidence. wmi.reset
+         re-verifies the repository itself and refuses to run when it is
+         consistent, whatever the plan said.
     ===========================================================================
 #>
 
@@ -83,12 +94,17 @@ function New-MDRepairContext {
     .PARAMETER BackupRoot
         Where anything we delete or overwrite is copied first. One folder per
         run, so an operator can always put things back.
+    .PARAMETER Findings
+        The diagnosis this repair run is acting on. It is what turns "run
+        services.fix" into "run services.fix against BITS": the actions come
+        from the plan, but their scope comes from the findings.
 #>
     param(
         [Parameter(Mandatory)] $ClientInfo,
         [Parameter(Mandatory)][string] $Level,
         [string] $ScriptRoot,
         [string] $BackupRoot,
+        $Findings,
         [switch] $Force,
         [switch] $DryRun
     )
@@ -98,12 +114,16 @@ function New-MDRepairContext {
     }
 
     [pscustomobject]@{
-        ClientInfo = $ClientInfo
-        Level      = $Level
-        ScriptRoot = $ScriptRoot
-        BackupRoot = $BackupRoot
-        Force      = [bool]$Force
-        DryRun     = [bool]$DryRun
+        ClientInfo     = $ClientInfo
+        Level          = $Level
+        ScriptRoot     = $ScriptRoot
+        BackupRoot     = $BackupRoot
+        # Exactly which services services.fix may touch. Empty means the
+        # diagnosis blamed none of them, which the repair reads as "core
+        # services only" rather than "all of them".
+        TargetServices = @(Get-MDImplicatedServiceNames -Findings $Findings)
+        Force          = [bool]$Force
+        DryRun         = [bool]$DryRun
     }
 }
 
@@ -226,26 +246,100 @@ function Start-MDServiceSafely {
 }
 
 
+function Get-MDImplicatedServiceNames {
+<#
+    .SYNOPSIS
+        The services the diagnosis actually blamed.
+    .DESCRIPTION
+        Every services.fix finding carries the offending service in Data.Service.
+        Reading it back here is what lets a repair act on the one service that
+        caused the problem instead of the whole table.
+#>
+    param($Findings)
+
+    $names = foreach ($f in @($Findings)) {
+        if ($f.Status -notin @('Warn', 'Fail')) { continue }
+        if (-not $f.RepairIds -or ($f.RepairIds -notcontains $script:MDRepairIds.ServicesFix)) { continue }
+        if ($f.Data -and $f.Data.Service) { $f.Data.Service }
+    }
+
+    @($names | Where-Object { $_ } | Select-Object -Unique)
+}
+
+
+function Get-MDServiceRepairTargets {
+<#
+    .SYNOPSIS
+        Resolves service names into the specs a services.fix run may touch.
+    .DESCRIPTION
+        One broken BITS does not become a licence to normalise W32Time,
+        TrustedInstaller, msiserver and wuauserv on a machine where nothing
+        else was wrong, so the caller passes exactly the names the diagnosis
+        implicated and gets back exactly those.
+
+        With no names at all (-NoDiagnose, or -Only services.fix on its own)
+        the fallback is the core MECM dependencies. Conditional Windows
+        services are never touched without a finding that names them, because
+        "differs from a hard-coded expected value" is not a fault.
+    .OUTPUTS
+        The matching entries from $script:MDRequiredServices.
+#>
+    param([string[]] $Names)
+
+    $wanted = @($Names | Where-Object { $_ } | Select-Object -Unique)
+
+    if ($wanted.Count -gt 0) {
+        return @($script:MDRequiredServices | Where-Object { $wanted -contains $_.Name })
+    }
+
+    @($script:MDRequiredServices | Where-Object { $_.Class -eq 'Core' })
+}
+
+
 # ===========================================================================
 #  SAFE TIER
 # ===========================================================================
 
 function Repair-MDServices {
-    <# Corrects start modes and starts anything that should be running. #>
+<#
+    .SYNOPSIS
+        Starts and re-enables the specific services the diagnosis implicated.
+    .DESCRIPTION
+        The service list comes from Context.TargetServices, which the repair
+        planner fills in from the findings. Nothing outside that list is read,
+        started, or reconfigured.
+#>
     param([Parameter(Mandatory)] $Context)
 
     $id      = $script:MDRepairIds.ServicesFix
     $changed = @()
     $failed  = @()
 
-    foreach ($spec in $script:MDRequiredServices) {
+    $targets = Get-MDServiceRepairTargets -Names $Context.TargetServices
+    if (@($targets).Count -eq 0) {
+        return New-MDRepairResult -Id $id -Name 'Correct client service configuration' -Status 'NotNeeded' `
+            -Detail 'no service was implicated by the diagnosis'
+    }
+
+    $scope = ($targets | ForEach-Object { $_.Name }) -join ', '
+    Write-MDDetail -Text ('acting on: {0}' -f $scope) -Bullet '- '
+
+    foreach ($spec in $targets) {
         $svc = Get-MDService -Name $spec.Name
         if (-not $svc) { continue }
 
         $start = Get-MDServiceStartMode -Name $spec.Name
 
         # Correct a wrong start mode first - starting a Disabled service fails.
-        if ($start -and ($spec.AllowedStart -notcontains $start)) {
+        # A conditional service is only ever moved off Disabled; its Auto/Manual
+        # choice belongs to whoever built the machine.
+        $needsStartMode = if ($spec.Class -eq 'Core') {
+            ($start -and ($spec.AllowedStart -notcontains $start))
+        } else {
+            ($start -eq 'Disabled')
+        }
+
+        if ($needsStartMode) {
             $want = $spec.AllowedStart[0]
             $psStartupType = if ($want -eq 'Auto') { 'Automatic' } else { $want }
 
@@ -263,7 +357,11 @@ function Repair-MDServices {
             }
         }
 
-        if ($spec.MustRun -and $svc.Status -ne 'Running') {
+        # A conditional service is started too when it was disabled: leaving it
+        # enabled but stopped fixes nothing that was actually diagnosed.
+        $needsStart = ($svc.Status -ne 'Running') -and ($spec.MustRun -or $needsStartMode)
+
+        if ($needsStart) {
             if ($Context.DryRun) {
                 $changed += ('would start {0}' -f $spec.Name)
             }
@@ -276,22 +374,24 @@ function Repair-MDServices {
         }
     }
 
+    $scopeNote = ('scope: {0} - no other service was inspected or changed' -f $scope)
+
     if ($Context.DryRun -and $changed.Count -gt 0) {
         return New-MDRepairResult -Id $id -Name 'Correct client service configuration' -Status 'DryRun' `
-            -Detail ('{0} change(s) planned' -f $changed.Count) -Evidence $changed
+            -Detail ('{0} change(s) planned' -f $changed.Count) -Evidence ($changed + $scopeNote)
     }
     if ($changed.Count -eq 0 -and $failed.Count -eq 0) {
         return New-MDRepairResult -Id $id -Name 'Correct client service configuration' -Status 'NotNeeded' `
-            -Detail 'all required services are configured and running'
+            -Detail ('{0} already configured and running' -f $scope)
     }
     if ($failed.Count -gt 0) {
         return New-MDRepairResult -Id $id -Name 'Correct client service configuration' -Status 'Failed' `
             -Detail ('{0} change(s) applied, {1} failed' -f $changed.Count, $failed.Count) `
-            -Evidence ($changed + $failed + 'A service that refuses to start or immediately reverts is usually being held that way by Group Policy.')
+            -Evidence ($changed + $failed + $scopeNote + 'A service that refuses to start or immediately reverts is usually being held that way by Group Policy.')
     }
 
     New-MDRepairResult -Id $id -Name 'Correct client service configuration' -Status 'Success' `
-        -Detail ('{0} change(s) applied' -f $changed.Count) -Evidence $changed
+        -Detail ('{0} change(s) applied' -f $changed.Count) -Evidence ($changed + $scopeNote)
 }
 
 
@@ -640,7 +740,7 @@ function Repair-MDWmiSalvage {
 
         return New-MDRepairResult -Id $id -Name 'Salvage the WMI repository' -Status 'Failed' `
             -Detail 'repository is still inconsistent after salvage' `
-            -Evidence ($evidence + 'Salvage was not enough. A full reset is available at -Level Aggressive, but it discards every custom WMI class on the machine - schedule it deliberately.')
+            -Evidence ($evidence + 'Salvage was not enough. A full reset (wmi.reset, -Level Aggressive) is the next step, but it discards every custom WMI class on this machine and warns and asks for its own confirmation before it runs - schedule it deliberately.')
     }
     finally {
         if ($ccmWasRunning) { [void](Start-MDServiceSafely -Name 'CcmExec') }
@@ -685,91 +785,6 @@ function Repair-MDPolicyReset {
     New-MDRepairResult -Id $id -Name 'Reset and re-download client policy' -Status 'Success' `
         -Detail 'policy purged and re-requested' `
         -Evidence @('The client will be missing deployments until the download completes. Allow 15 minutes, then re-run diagnose.')
-}
-
-
-function Repair-MDReregister {
-<#
-    .SYNOPSIS
-        Forces the client to obtain a new identity from the site.
-    .DESCRIPTION
-        Stops CcmExec, removes the persisted identity (SMSCFG.INI) and the
-        client certificates, then starts CcmExec again. The client generates a
-        new self-signed certificate and registers from scratch.
-
-        Both removed items are backed up first. Note that this produces a new
-        client GUID, so historical inventory in the console is orphaned - which
-        is normally exactly what you want on a broken or cloned machine.
-#>
-    param([Parameter(Mandatory)] $Context)
-
-    $id = $script:MDRepairIds.Reregister
-
-    if (-not $Context.ClientInfo.Installed) {
-        return New-MDRepairResult -Id $id -Name 'Re-register the client with the site' -Status 'Skipped' -Detail 'client not installed'
-    }
-
-    $smscfg = Join-Path $env:windir 'SMSCFG.INI'
-
-    if ($Context.DryRun) {
-        return New-MDRepairResult -Id $id -Name 'Re-register the client with the site' -Status 'DryRun' `
-            -Detail 'would remove SMSCFG.INI and the SMS certificates, then restart CcmExec' `
-            -Evidence @($smscfg, 'Cert:\LocalMachine\SMS')
-    }
-
-    if (-not $Context.Force) {
-        $ok = Read-MDConfirm -Question 'Re-registering assigns a NEW client GUID; existing inventory history for this device is orphaned. Continue?' -DefaultYes
-        if (-not $ok) {
-            return New-MDRepairResult -Id $id -Name 'Re-register the client with the site' -Status 'Skipped' -Detail 'declined by operator'
-        }
-    }
-
-    $evidence = @()
-
-    [void](Stop-MDServiceSafely -Name 'CcmExec')
-
-    # --- persisted identity -------------------------------------------------
-    if (Test-Path -LiteralPath $smscfg) {
-        $backup = Save-MDBackupCopy -Context $Context -Path $smscfg -SubFolder 'identity'
-        try {
-            Remove-Item -LiteralPath $smscfg -Force -ErrorAction Stop
-            $evidence += ('removed {0}{1}' -f $smscfg, $(if ($backup) { " (backed up to $backup)" } else { '' }))
-        }
-        catch {
-            $evidence += ('could not remove {0}: {1}' -f $smscfg, $_.Exception.Message)
-        }
-    }
-
-    # --- client certificates ------------------------------------------------
-    try {
-        $certs = @(Get-ChildItem -Path 'Cert:\LocalMachine\SMS' -ErrorAction Stop)
-        foreach ($c in $certs) {
-            try {
-                Remove-Item -Path ('Cert:\LocalMachine\SMS\' + $c.Thumbprint) -Force -ErrorAction Stop
-                $evidence += ('removed certificate {0} ({1})' -f $c.Thumbprint, $c.Subject)
-            }
-            catch {
-                $evidence += ('could not remove certificate {0}: {1}' -f $c.Thumbprint, $_.Exception.Message)
-            }
-        }
-        if ($certs.Count -eq 0) { $evidence += 'SMS certificate store was already empty' }
-    }
-    catch {
-        $evidence += ('SMS certificate store unavailable: {0}' -f $_.Exception.Message)
-    }
-
-    if (-not (Start-MDServiceSafely -Name 'CcmExec')) {
-        return New-MDRepairResult -Id $id -Name 'Re-register the client with the site' -Status 'Failed' `
-            -Detail 'CcmExec did not restart' -Evidence $evidence
-    }
-
-    # Registration is asynchronous; give the agent a moment before nudging it.
-    Start-Sleep -Seconds 10
-    [void](Invoke-MDTriggerSchedule -ScheduleId '{00000000-0000-0000-0000-000000000021}' -Name 'Machine Policy Retrieval')
-
-    New-MDRepairResult -Id $id -Name 'Re-register the client with the site' -Status 'Success' `
-        -Detail 'identity cleared and CcmExec restarted' `
-        -Evidence ($evidence + 'Watch ClientIDManagerStartup.log for "Client is registered". This normally takes 5-10 minutes.')
 }
 
 
@@ -998,31 +1013,89 @@ function Repair-MDGroupPolicyPol {
 function Repair-MDWmiReset {
 <#
     .SYNOPSIS
-        Resets the WMI repository from scratch.
+        Resets the WMI repository from scratch. The most destructive thing this
+        tool can do to a machine that is staying where it is.
     .DESCRIPTION
-        Destructive: every custom class and every piece of data added by any
-        product since the OS was installed is discarded. Windows recompiles its
-        own MOFs automatically; third-party products (including the MECM client)
-        usually need a repair afterwards to put theirs back.
+        Every custom class and every piece of data added by any product since
+        the OS was installed is discarded. Windows recompiles its own MOFs
+        automatically; third-party products - antivirus, monitoring agents,
+        management tooling and the MECM client itself - usually need a repair
+        or a reinstall afterwards to put theirs back.
+
+        Because of that, this action refuses to run on evidence it does not
+        have:
+
+          * it re-runs winmgmt /verifyrepository immediately beforehand, and
+            stops if the repository verifies as consistent. Repository size,
+            age or a stale finding from earlier in the run are never enough
+          * it prints what the evidence actually is, and what a reset will cost
+          * it then asks its own question, separately from any confirmation the
+            repair plan already collected
+
+        Salvage (wmi.salvage) runs earlier in the same plan and is the correct
+        first attempt; by the time this runs, salvage has usually already fixed
+        the problem and the verify below reports consistent.
 #>
     param([Parameter(Mandatory)] $Context)
 
     $id      = $script:MDRepairIds.WmiReset
+    $name    = 'Reset the WMI repository'
     $winmgmt = Join-Path $env:windir 'System32\wbem\winmgmt.exe'
 
+    # --- evidence check -----------------------------------------------------
+    # Deliberately not gated on -DryRun: knowing whether the reset would even
+    # be attempted is the single most useful thing a dry run can report here.
+    Write-MDDetail -Text 'confirming the repository is actually corrupt before considering a reset' -Bullet '- '
+    $check     = Invoke-MDProcess -FilePath $winmgmt -ArgumentList @('/verifyrepository') -TimeoutSeconds 180
+    $checkText = (($check.StdOut + ' ' + $check.StdErr)).Trim()
+    $consistent = ($check.ExitCode -eq 0 -and $checkText -match '(?i)consistent' -and -not $check.TimedOut)
+
+    if ($checkText -match '0x80041003' -or $checkText -match '(?i)access denied') {
+        return New-MDRepairResult -Id $id -Name $name -Status 'Skipped' `
+            -Detail 'cannot confirm repository corruption without elevation' `
+            -Evidence @($checkText, 'Re-run via mecmdoctor.bat. This action will not reset a repository it has not been able to verify.')
+    }
+
+    if ($consistent) {
+        return New-MDRepairResult -Id $id -Name $name -Status 'NotNeeded' `
+            -Detail 'the repository verifies as consistent, so a reset is not warranted' `
+            -Evidence @(
+                $checkText
+                'A reset discards every custom WMI class on this machine, and nothing here indicates it would fix anything.'
+                'Repository size on its own is never a reason to reset - if the repository is simply large, investigate what is writing to it instead.'
+            )
+    }
+
+    # --- from here the repository really is inconsistent ---------------------
+    $evidence = @(('winmgmt /verifyrepository exit {0}: {1}' -f $check.ExitCode, $checkText))
+    if ($check.TimedOut) { $evidence = @('winmgmt /verifyrepository did not respond within 180s - WMI is hung.') }
+
     if ($Context.DryRun) {
-        return New-MDRepairResult -Id $id -Name 'Reset the WMI repository' -Status 'DryRun' `
-            -Detail 'would run winmgmt /resetrepository' -RebootRecommended
+        return New-MDRepairResult -Id $id -Name $name -Status 'DryRun' `
+            -Detail 'repository is inconsistent, so a reset would be offered here' `
+            -Evidence ($evidence + 'Running for real, this would print the risks and ask for a separate confirmation before touching anything.') `
+            -RebootRecommended
     }
 
-    if (-not $Context.Force) {
-        $ok = Read-MDConfirm -Question 'Reset the WMI repository? This DISCARDS every custom WMI class on this machine and requires a client repair and a reboot afterwards.'
-        if (-not $ok) {
-            return New-MDRepairResult -Id $id -Name 'Reset the WMI repository' -Status 'Skipped' -Detail 'declined by operator'
-        }
+    # --- the warning, then its own confirmation -----------------------------
+    Write-MDLine ''
+    Write-MDWarn 'WMI REPOSITORY RESET - read this before answering.'
+    Write-MDDetail -Indent 9 -Color 'DarkYellow' -Bullet '! ' -Text @(
+        'Why this is being offered: winmgmt reports the repository inconsistent, and the diagnosis found independent evidence that WMI is not working correctly.'
+        'What it does: rebuilds the repository from the MOF files on disk.'
+        'What it costs: every custom WMI class and all data added since Windows was installed is discarded. Antivirus, monitoring, inventory and management agents can lose their WMI registration and may need repairing or reinstalling.'
+        'The Configuration Manager client will need a client repair afterwards, and the machine needs a reboot.'
+        'Salvage (wmi.salvage) is the non-destructive alternative and has already run if it was in this plan.'
+    )
+    Write-MDLine ''
+
+    $ok = Read-MDConfirm -Question 'WMI corruption was detected after health checks. Resetting WMI may affect applications and system management components. Continue?' -Force:$Context.Force
+    if (-not $ok) {
+        return New-MDRepairResult -Id $id -Name $name -Status 'Skipped' `
+            -Detail 'declined by operator' `
+            -Evidence ($evidence + 'Nothing was changed. Salvage remains available at -Level Standard.')
     }
 
-    $evidence = @()
     [void](Stop-MDServiceSafely -Name 'CcmExec')
 
     Write-MDDetail -Text 'running winmgmt /resetrepository' -Bullet '- '
@@ -1035,15 +1108,13 @@ function Repair-MDWmiReset {
 
     [void](Start-MDServiceSafely -Name 'CcmExec')
 
-    $consistent = ($verify.ExitCode -eq 0 -and $verifyText -match '(?i)consistent')
+    $nowConsistent = ($verify.ExitCode -eq 0 -and $verifyText -match '(?i)consistent')
 
-    New-MDRepairResult -Id $id -Name 'Reset the WMI repository' -Status $(if ($consistent) { 'Success' } else { 'Failed' }) `
-        -Detail $(if ($consistent) { 'repository rebuilt and consistent' } else { 'repository is still not consistent' }) `
-        -Evidence ($evidence + 'Repair the client next so it recompiles its own MOF files, then reboot.') `
+    New-MDRepairResult -Id $id -Name $name -Status $(if ($nowConsistent) { 'Success' } else { 'Failed' }) `
+        -Detail $(if ($nowConsistent) { 'repository rebuilt and consistent' } else { 'repository is still not consistent' }) `
+        -Evidence ($evidence + 'Repair the client next so it recompiles its own MOF files, then reboot. Check any other agent that registers WMI classes.') `
         -RebootRecommended
 }
-
-
 function Repair-MDGroupPolicyState {
 <#
     .SYNOPSIS
@@ -1405,11 +1476,13 @@ $script:MDRepairCatalog = @(
     @{ Id = $script:MDRepairIds.WmiSalvage;     Level = 'Standard';   Order = 110; Action = { param($c) Repair-MDWmiSalvage $c } }
     @{ Id = $script:MDRepairIds.GpRepairPol;    Level = 'Standard';   Order = 120; Action = { param($c) Repair-MDGroupPolicyPol $c } }
     @{ Id = $script:MDRepairIds.PolicyReset;    Level = 'Standard';   Order = 130; Action = { param($c) Repair-MDPolicyReset $c } }
-    @{ Id = $script:MDRepairIds.Reregister;     Level = 'Standard';   Order = 140; Action = { param($c) Repair-MDReregister $c } }
     @{ Id = $script:MDRepairIds.UpdatesReset;   Level = 'Standard';   Order = 150; Action = { param($c) Repair-MDUpdatesReset $c } }
     @{ Id = $script:MDRepairIds.ClientRepair;   Level = 'Standard';   Order = 160; Action = { param($c) Repair-MDClientRepair $c } }
 
-    @{ Id = $script:MDRepairIds.WmiReset;       Level = 'Aggressive'; Order = 210; Action = { param($c) Repair-MDWmiReset $c } }
+    # NeedsEvidence: -All will not pick this up. A repository reset only ever
+    # enters a plan because a finding named it, or because the operator asked
+    # for it by id with -Only.
+    @{ Id = $script:MDRepairIds.WmiReset;       Level = 'Aggressive'; Order = 210; NeedsEvidence = $true; Action = { param($c) Repair-MDWmiReset $c } }
     @{ Id = $script:MDRepairIds.GpResetState;   Level = 'Aggressive'; Order = 220; Action = { param($c) Repair-MDGroupPolicyState $c } }
     @{ Id = $script:MDRepairIds.GpResetSecEdit; Level = 'Aggressive'; Order = 230; Action = { param($c) Repair-MDSecEditDatabase $c } }
     @{ Id = $script:MDRepairIds.ClientReinstall;Level = 'Aggressive'; Order = 240; Action = { param($c) Repair-MDClientReinstall $c } }
@@ -1439,6 +1512,11 @@ function Get-MDRepairPlan {
         what makes `repair` safe to run on a healthy machine. -All ignores the
         findings and runs everything at the level; -Only runs exactly the ids
         given, regardless of level.
+
+        Actions marked NeedsEvidence are exempt from -All. They are destructive
+        enough that "run everything at this tier" is not an adequate reason to
+        include them: a finding has to have named the action, or the operator
+        has to name it with -Only.
 #>
     param(
         [Parameter(Mandatory)][ValidateSet('Safe', 'Standard', 'Aggressive')][string] $Level,
@@ -1472,7 +1550,8 @@ function Get-MDRepairPlan {
 
     foreach ($entry in $script:MDRepairCatalog) {
         if ($allowedLevels -notcontains $entry.Level) { continue }
-        if ($All -or ($indicated -contains $entry.Id)) { $plan += $entry }
+        if ($indicated -contains $entry.Id) { $plan += $entry; continue }
+        if ($All -and -not $entry.NeedsEvidence) { $plan += $entry }
     }
 
     $plan | Sort-Object { $_.Order }

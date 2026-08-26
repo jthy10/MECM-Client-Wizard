@@ -7,8 +7,9 @@
      Manager (MECM / SCCM / ConfigMgr) clients.
 
        mecmdoctor diagnose      read-only health check of the whole client
-       mecmdoctor repair        apply targeted, tiered repairs
+       mecmdoctor repair        diagnose, explain, confirm, then repair
        mecmdoctor logs          parse C:\Windows\CCM\Logs and translate errors
+       mecmdoctor bundle        build a support ZIP for someone else to read
        mecmdoctor reinstall     remove and reinstall the client
        mecmdoctor help          full usage
 
@@ -28,10 +29,23 @@
        lib\Checks.ps1        all diagnostics (read-only)
        lib\Repairs.ps1       all repair actions (the only code that writes)
        lib\Report.ps1        summary rendering and JSON export
+       lib\Bundle.ps1        the support bundle
 
      ClientReinstall.ps1     OPTIONAL. Drop your own reinstall script beside
                              this file and mecmdoctor uses it instead of its
                              built-in fallback. See ClientReinstall.example.ps1.
+
+    ---------------------------------------------------------------------------
+     WHAT THIS TOOL WILL NOT DO
+
+       * It never resets the client identity. No repair deletes SMSCFG.INI or
+         the SMS certificate store, because that gives the device a new client
+         GUID and orphans its history in the console. Restarting CcmExec makes
+         the client re-register under the identity it already has.
+       * It never reboots.
+       * It never resets the WMI repository on weak evidence. Repository size
+         alone is a warning, never a repair, and wmi.reset re-verifies the
+         repository itself before it will run.
 
     ---------------------------------------------------------------------------
      EXIT CODES
@@ -53,11 +67,12 @@ param(
 
     # The command to run. Positional so "MECMDoctor.ps1 diagnose" just works.
     [Parameter(Position = 0)]
-    [ValidateSet('diagnose', 'repair', 'logs', 'reinstall', 'help', 'version')]
+    [ValidateSet('diagnose', 'repair', 'logs', 'bundle', 'reinstall', 'help', 'version')]
     [string] $Command = 'diagnose',
 
     # Repair tier. Safe = reversible; Standard = rebuilds regenerable state;
     # Aggressive = destructive, always confirmed unless -Force.
+    # Left unset, `repair` uses the tier the diagnosis recommends.
     [ValidateSet('Safe', 'Standard', 'Aggressive')]
     [string] $Level = 'Standard',
 
@@ -66,7 +81,8 @@ param(
     [string[]] $Only,
 
     # Run every repair at the chosen tier, not just the ones the diagnosis
-    # actually implicated.
+    # actually implicated. Actions that require evidence (wmi.reset) are still
+    # excluded - name them with -Only if you really mean it.
     [switch] $All,
 
     # Skip the diagnosis pass before repairing. Only meaningful with -Only/-All.
@@ -77,7 +93,8 @@ param(
 
     # ---- safety ------------------------------------------------------------
 
-    # Answer yes to every confirmation. Required for unattended destructive runs.
+    # Answer yes to every confirmation, including the "continue into repairs?"
+    # gate. Required for unattended runs.
     [switch] $Force,
 
     # Show what would happen and change nothing.
@@ -94,6 +111,7 @@ param(
     [switch] $IncludeWarnings,
 
     # Skip the log parsing pass (much faster on a machine with huge logs).
+    # For `bundle`, also leaves the CCM logs out of the ZIP.
     [switch] $SkipLogs,
 
     # ---- output ------------------------------------------------------------
@@ -103,6 +121,10 @@ param(
 
     # Also write a machine-readable JSON report to this path.
     [string] $Json,
+
+    # Where `bundle` writes its ZIP. A folder, or a full path ending in .zip.
+    # Default: %ProgramData%\MECMDoctor\Bundles.
+    [string] $BundlePath,
 
     [switch] $NoColor,
     [switch] $Quiet,
@@ -115,7 +137,11 @@ param(
 $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'   # Invoke-WebRequest is much faster without it
 
-$script:MDVersion = '1.0.0'
+$script:MDVersion = '1.1.0'
+
+# Whether the operator actually chose a tier. Left alone, `repair` follows the
+# tier the diagnosis recommends rather than a hard-coded default.
+$script:MDLevelExplicit = $PSBoundParameters.ContainsKey('Level')
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +159,7 @@ $libFiles = @(
     'Checks.ps1'
     'Repairs.ps1'
     'Report.ps1'
+    'Bundle.ps1'
 )
 
 foreach ($file in $libFiles) {
@@ -170,8 +197,9 @@ function Show-MDHelp {
     Write-MDLine ''
     $commands = @(
         [pscustomobject]@{ Name = 'diagnose';  What = 'Read-only health check. Changes nothing. This is the default.' }
-        [pscustomobject]@{ Name = 'repair';    What = 'Diagnose, then apply the repairs the diagnosis implicated.' }
+        [pscustomobject]@{ Name = 'repair';    What = 'Diagnose, explain what is recommended and why, ask, then repair.' }
         [pscustomobject]@{ Name = 'logs';      What = 'Parse the CCM logs and translate every error found.' }
+        [pscustomobject]@{ Name = 'bundle';    What = 'Diagnose, then build a timestamped support ZIP for someone else to read.' }
         [pscustomobject]@{ Name = 'reinstall'; What = 'Remove and reinstall the client (uses your ClientReinstall.ps1 if present).' }
         [pscustomobject]@{ Name = 'help';      What = 'This text.' }
         [pscustomobject]@{ Name = 'version';   What = 'Print the version and exit.' }
@@ -181,33 +209,47 @@ function Show-MDHelp {
         @{ Header = 'WHAT IT DOES'; Property = 'What'; Width = 84 }
     )
 
+    Write-MDSection 'How repair works'
+    Write-MDLine ''
+    Write-MDDetail -Indent 2 -Text @(
+        '1. It runs the full diagnosis first.'
+        '2. It prints the findings, then the repairs those findings implicated and which finding asked for each.'
+        '3. It asks whether to continue at the tier the diagnosis recommends - "Diagnosis recommends Standard repairs. Continue?"'
+        '4. Nothing runs until you answer yes. The default is no, so a bare Enter cancels. -Force answers yes for unattended runs; -DryRun skips the question because nothing is changed.'
+        '5. Destructive actions ask again, individually, with their own explanation of what the action costs.'
+        ''
+        'Passing -Level yourself overrides the recommendation. Leaving it off lets the diagnosis choose.'
+    )
+
     Write-MDSection 'Repair tiers'
     Write-MDLine ''
-    Write-MDKeyValue -Key 'Safe'       -Value 'Restart services, clear the cache and failed BITS jobs, trigger client cycles, gpupdate.' -KeyWidth 12
+    Write-MDKeyValue -Key 'Safe'       -Value 'Start and re-enable an implicated service, restart CcmExec, clear the cache and failed BITS' -KeyWidth 12
+    Write-MDKeyValue -Key ''           -Value 'jobs, trigger client cycles, gpupdate, run ccmeval.' -KeyWidth 12
     Write-MDKeyValue -Key ''           -Value 'Reversible. Safe on a production machine during the day.' -KeyWidth 12
     Write-MDLine ''
     Write-MDKeyValue -Key 'Standard'   -Value 'Everything in Safe, plus: salvage the WMI repository, quarantine corrupt Registry.pol,' -KeyWidth 12
-    Write-MDKeyValue -Key ''           -Value 'purge and re-download policy, re-register the client, reset Windows Update, repair the client.' -KeyWidth 12
-    Write-MDKeyValue -Key ''           -Value 'Rebuilds state that Windows or the client regenerates by itself. This is the default.' -KeyWidth 12
+    Write-MDKeyValue -Key ''           -Value 'purge and re-download policy, reset Windows Update, repair the client.' -KeyWidth 12
+    Write-MDKeyValue -Key ''           -Value 'Rebuilds state that Windows or the client regenerates by itself.' -KeyWidth 12
     Write-MDLine ''
     Write-MDKeyValue -Key 'Aggressive' -Value 'Everything above, plus: reset the WMI repository, clear Group Policy state,' -KeyWidth 12
     Write-MDKeyValue -Key ''           -Value 'rebuild the security database, reinstall the client.' -KeyWidth 12
-    Write-MDKeyValue -Key ''           -Value 'DESTRUCTIVE. Always prompts unless -Force is given.' -KeyWidth 12
+    Write-MDKeyValue -Key ''           -Value 'DESTRUCTIVE. Every action prompts individually unless -Force is given.' -KeyWidth 12
 
     Write-MDSection 'Options'
     Write-MDLine ''
     $options = @(
-        [pscustomobject]@{ Flag = '-Level <tier>';   What = 'Safe | Standard | Aggressive. Default: Standard.' }
+        [pscustomobject]@{ Flag = '-Level <tier>';   What = 'Safe | Standard | Aggressive. Default: whatever the diagnosis recommends.' }
         [pscustomobject]@{ Flag = '-DryRun';         What = 'Show what would happen, change nothing. Aliased to -WhatIf.' }
-        [pscustomobject]@{ Flag = '-Force';          What = 'Answer yes to every confirmation. Needed for unattended destructive runs.' }
+        [pscustomobject]@{ Flag = '-Force';          What = 'Answer yes to every confirmation, including the repair gate. For unattended runs.' }
         [pscustomobject]@{ Flag = '-Only <ids>';     What = 'Run only these repair actions, ignoring tier and diagnosis.' }
-        [pscustomobject]@{ Flag = '-All';            What = 'Run every repair at the tier, not just the implicated ones.' }
+        [pscustomobject]@{ Flag = '-All';            What = 'Run every repair at the tier except those that require evidence.' }
         [pscustomobject]@{ Flag = '-NoDiagnose';     What = 'Skip the diagnosis pass before repairing.' }
         [pscustomobject]@{ Flag = '-Verify';         What = 'Re-run the diagnosis after repairing.' }
         [pscustomobject]@{ Flag = '-Days <n>';       What = 'How many days of CCM logs to scan. Default: 7.' }
         [pscustomobject]@{ Flag = '-IncludeWarnings';What = 'Report log warnings as well as errors.' }
-        [pscustomobject]@{ Flag = '-SkipLogs';       What = 'Skip log parsing entirely. Much faster.' }
+        [pscustomobject]@{ Flag = '-SkipLogs';       What = 'Skip log parsing; also leaves CCM logs out of a bundle. Much faster.' }
         [pscustomobject]@{ Flag = '-Json <path>';    What = 'Also write a machine-readable JSON report.' }
+        [pscustomobject]@{ Flag = '-BundlePath';     What = 'Where bundle writes its ZIP: a folder, or a full path ending in .zip.' }
         [pscustomobject]@{ Flag = '-LogDirectory';   What = 'Where transcripts go. Default: %ProgramData%\MECMDoctor\Logs.' }
         [pscustomobject]@{ Flag = '-NoColor';        What = 'Plain output, for piping to a file.' }
         [pscustomobject]@{ Flag = '-Quiet';          What = 'Less console chatter. The transcripts stay complete.' }
@@ -221,11 +263,16 @@ function Show-MDHelp {
     Write-MDSection 'Repair action ids (for -Only)'
     Write-MDLine ''
     $actions = foreach ($entry in ($script:MDRepairCatalog | Sort-Object { $_.Order })) {
-        [pscustomobject]@{ Id = $entry.Id; Tier = $entry.Level }
+        [pscustomobject]@{
+            Id   = $entry.Id
+            Tier = $entry.Level
+            Note = $(if ($entry.NeedsEvidence) { 'needs evidence - excluded from -All' } else { '' })
+        }
     }
     Write-MDTable -Rows $actions -Indent 2 -Columns @(
         @{ Header = 'ACTION ID'; Property = 'Id'; Width = 24 }
         @{ Header = 'TIER'; Property = 'Tier'; Width = 12 }
+        @{ Header = 'NOTE'; Property = 'Note'; Width = 40 }
     )
 
     Write-MDSection 'Examples'
@@ -234,6 +281,9 @@ function Show-MDHelp {
         'mecmdoctor diagnose'
         'mecmdoctor diagnose -SkipLogs -Json C:\Temp\client.json'
         'mecmdoctor logs -Days 14 -IncludeWarnings'
+        'mecmdoctor bundle'
+        'mecmdoctor bundle -BundlePath C:\Temp'
+        'mecmdoctor repair                                 # asks before it repairs anything'
         'mecmdoctor repair -DryRun'
         'mecmdoctor repair -Level Safe'
         'mecmdoctor repair -Level Standard -Verify'
@@ -242,6 +292,15 @@ function Show-MDHelp {
         'mecmdoctor reinstall'
     )
     foreach ($e in $examples) { Write-MDLine ('  ' + $e) -Color 'Cyan' }
+
+    Write-MDSection 'What mecmdoctor will not do'
+    Write-MDLine ''
+    Write-MDDetail -Indent 2 -Bullet '- ' -Text @(
+        'It never resets the client identity. No repair deletes SMSCFG.INI or the SMS certificate store: that assigns a new client GUID and orphans the device history in the console. Restarting CcmExec re-registers the client under the identity it already has.'
+        'It never reboots. A pending reboot is reported and explained; scheduling it is your call.'
+        'It never resets the WMI repository because the repository is large. A reset needs winmgmt to report the repository inconsistent AND independent health checks to agree, and it re-verifies and asks again before it runs.'
+        'It never changes the startup configuration of W32Time, TrustedInstaller, msiserver, wuauserv or BITS just because it differs from an expected value. Those are repaired only when a diagnosed failure is correlated with them.'
+    )
 
     Write-MDSection 'Custom reinstall script'
     Write-MDLine ''
@@ -257,8 +316,6 @@ function Show-MDHelp {
     )
     Write-MDLine ''
 }
-
-
 # ---------------------------------------------------------------------------
 # The diagnosis pass
 # ---------------------------------------------------------------------------
@@ -334,6 +391,11 @@ function Invoke-MDDiagnose {
         Write-MDSection 'CCM log analysis'
         Write-MDSkip 'No client log directory is known, so there is nothing to parse.'
     }
+
+    # Last, because it needs everything above it: a conditional Windows service
+    # is only a fault when something else is failing because of it.
+    Write-MDSection 'Service correlation'
+    $findings = Resolve-MDServiceCorrelation -Findings $findings
 
     $findings
 }
@@ -435,14 +497,26 @@ try {
                 Write-MDSkip 'Skipped (-NoDiagnose). Repairs will be selected from -Only / -All alone.'
             }
 
-            # Client discovery is re-read after a diagnosis in case a check
-            # populated something we did not know at the start.
-            $context = New-MDRepairContext -ClientInfo $clientInfo -Level $Level `
-                                           -ScriptRoot $script:MDRoot -Force:$Force -DryRun:$DryRun
+            # The tier: the operator's if they named one, otherwise whatever the
+            # diagnosis concluded. -Only names the actions outright, so nothing
+            # about it is the diagnosis's recommendation and it is not framed
+            # as one.
+            $usingOnly          = ($Only -and @($Only).Count -gt 0)
+            $effectiveLevel     = $Level
+            $levelFromDiagnosis = $false
 
-            $plan = Get-MDRepairPlan -Level $Level -Findings $findings -Only $Only -All:$All
+            if (-not $script:MDLevelExplicit -and -not $usingOnly -and $summary -and $summary.Recommended) {
+                $effectiveLevel     = $summary.Recommended
+                $levelFromDiagnosis = $true
+            }
 
-            Write-MDSection ('Repair plan  (tier: {0})' -f $Level)
+            $context = New-MDRepairContext -ClientInfo $clientInfo -Level $effectiveLevel `
+                                           -ScriptRoot $script:MDRoot -Findings $findings `
+                                           -Force:$Force -DryRun:$DryRun
+
+            $plan = Get-MDRepairPlan -Level $effectiveLevel -Findings $findings -Only $Only -All:$All
+
+            Write-MDSection ('Repair plan  (tier: {0})' -f $effectiveLevel)
             Write-MDLine ''
 
             if (-not $plan -or @($plan).Count -eq 0) {
@@ -450,27 +524,53 @@ try {
                 Write-MDDetail -Text 'Use -All to run every action at this tier anyway, or -Only <id> to force a specific one.' -Indent 4
             }
             else {
-                $planRows = foreach ($p in @($plan)) {
-                    [pscustomobject]@{ Order = $p.Order; Id = $p.Id; Tier = $p.Level }
+                # Which repairs, and - just as importantly - why each one.
+                Write-MDRepairRationale -Plan $plan -Findings $findings -Context $context
+
+                if ($levelFromDiagnosis) {
+                    Write-MDLine ''
+                    Write-MDInfo 'Tier chosen by the diagnosis. Pass -Level to override it.'
                 }
-                Write-MDTable -Rows $planRows -Indent 2 -Columns @(
-                    @{ Header = '#';         Property = 'Order'; Width = 4 }
-                    @{ Header = 'ACTION ID'; Property = 'Id';    Width = 24 }
-                    @{ Header = 'TIER';      Property = 'Tier';  Width = 12 }
-                )
 
                 Write-MDLine ''
                 if ($DryRun) {
                     Write-MDInfo 'Dry run: every action below reports what it would do and changes nothing.'
                 }
 
-                $hasAggressive = @($plan | Where-Object { $_.Level -eq 'Aggressive' }).Count -gt 0
-                $proceed = $true
+                $aggressive = @($plan | Where-Object { $_.Level -eq 'Aggressive' })
+                $proceed    = $true
 
-                if ($hasAggressive -and -not $DryRun) {
+                # ---- the gate --------------------------------------------------
+                # Nothing below this point runs until the operator has said yes.
+                # -DryRun skips it because nothing is changed either way.
+                if (-not $DryRun) {
+                    Write-MDSection 'Confirmation'
                     Write-MDLine ''
-                    Write-MDWarn 'This plan contains DESTRUCTIVE actions. Each one prompts individually as well.'
-                    $proceed = Read-MDConfirm -Question ('Proceed with {0} repair action(s) on {1}?' -f @($plan).Count, $env:COMPUTERNAME) -Force:$Force
+
+                    $question = if ($levelFromDiagnosis) {
+                        'Diagnosis recommends {0} repairs. Continue?' -f $effectiveLevel
+                    } else {
+                        'Run {0} repair action(s) at the {1} tier on {2}. Continue?' -f @($plan).Count, $effectiveLevel, $env:COMPUTERNAME
+                    }
+
+                    # No -DefaultYes: a bare Enter, or a Read-Host that returns
+                    # nothing because stdin is not a console, must not start
+                    # repairs. Unattended runs say so explicitly with -Force.
+                    $proceed = Read-MDConfirm -Question $question -Force:$Force
+
+                    # Destructive actions are agreed to separately, and each one
+                    # asks again for itself when it runs.
+                    if ($proceed -and $aggressive.Count -gt 0) {
+                        Write-MDLine ''
+                        Write-MDWarn ('This plan contains {0} DESTRUCTIVE action(s):' -f $aggressive.Count)
+                        foreach ($a in $aggressive) { Write-MDDetail -Text $a.Id -Indent 6 -Bullet '! ' -Color 'DarkYellow' }
+                        Write-MDDetail -Indent 6 -Color 'DarkYellow' -Text @(
+                            'These discard state that does not come back on its own, and can require a reboot or a client reinstall afterwards.'
+                            'Each one explains what it costs and asks again before it does anything.'
+                        )
+                        Write-MDLine ''
+                        $proceed = Read-MDConfirm -Question ('Include the destructive action(s) in this run on {0}?' -f $env:COMPUTERNAME) -Force:$Force
+                    }
                 }
 
                 if (-not $proceed) {
@@ -500,6 +600,37 @@ try {
                     if     ($summary.Fail -gt 0) { $exitCode = 2 }
                     elseif ($summary.Warn -gt 0) { $exitCode = 1 }
                 }
+            }
+        }
+
+        # -------------------------------------------------------------------
+        'bundle' {
+            # A bundle is a diagnosis plus everything that makes the diagnosis
+            # interpretable by someone who is not sitting at this machine.
+            $findings = Invoke-MDDiagnose -ClientInfo $clientInfo -SkipLogParsing:$SkipLogs `
+                                          -LogDays $Days -LogWarnings:$IncludeWarnings
+            $summary  = Write-MDSummary -Findings $findings
+
+            Write-MDSection 'Support bundle'
+            Write-MDLine ''
+
+            $zip = New-MDSupportBundle -ClientInfo $clientInfo -Findings $findings -HostFacts $facts `
+                                       -OutputPath $BundlePath -Version $script:MDVersion -SkipLogs:$SkipLogs
+
+            Write-MDLine ''
+            if ($zip -and (Test-Path -LiteralPath $zip)) {
+                $zipSize = (Get-Item -LiteralPath $zip).Length
+                Write-MDOk ('Support bundle written: {0}' -f $zip)
+                Write-MDKeyValue -Key 'Bundle' -Value $zip -Indent 4
+                Write-MDKeyValue -Key 'Size'   -Value (Format-MDBytes $zipSize) -Indent 4
+                Write-MDDetail -Indent 4 -Text 'Read README.txt inside the ZIP for what it contains and what was deliberately left out.'
+
+                if     ($summary.Fail -gt 0) { $exitCode = 2 }
+                elseif ($summary.Warn -gt 0) { $exitCode = 1 }
+            }
+            else {
+                Write-MDFail 'The support bundle could not be produced.'
+                $exitCode = 4
             }
         }
 
@@ -545,6 +676,7 @@ try {
         1 { 'completed with warnings' }
         2 { 'problems found' }
         3 { 'one or more repair actions failed' }
+        4 { 'could not produce the requested output' }
         default { 'completed' }
     }
     Write-MDFooter -ExitNote ('exit {0} - {1}' -f $exitCode, $note)

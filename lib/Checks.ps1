@@ -21,34 +21,104 @@
 # ---------------------------------------------------------------------------
 
 # Services the client depends on, and what "healthy" means for each.
-#   MustRun      - the service has to be running right now
-#   AllowedStart - acceptable start modes; anything else is a finding
-#   Critical     - a failure here is Fail rather than Warn
+#
+#   Class        Core        - a genuine MECM dependency. When one of these is
+#                              stopped or disabled the client is broken, and
+#                              correcting it automatically is both safe and
+#                              obviously the right thing to do.
+#                Conditional - a Windows service the client only needs in
+#                              particular circumstances. Its configuration is
+#                              always reported, but it is only ever repaired
+#                              when a real, separately diagnosed symptom is
+#                              correlated with it. A disabled msiserver on a
+#                              machine with no MSI deployment failures is a
+#                              deliberate configuration choice, not a fault.
+#   MustRun      the service has to be running right now
+#   AllowedStart acceptable start modes; the first is what a repair restores to
+#   Critical     Core services only: a failure here is Fail rather than Warn
+#   Correlate    Conditional services only. Given the full finding set, returns
+#                the findings that turn "configured oddly" into "this is your
+#                problem". No matches means no repair is proposed.
 $script:MDRequiredServices = @(
-    @{ Name = 'CcmExec';    Display = 'SMS Agent Host';                   MustRun = $true;  AllowedStart = @('Auto');           Critical = $true;
+    # ---- core MECM dependencies -------------------------------------------
+    @{ Name = 'CcmExec';    Display = 'SMS Agent Host';                   Class = 'Core'; MustRun = $true;  AllowedStart = @('Auto');           Critical = $true;
        Note = 'The Configuration Manager client itself. Nothing works without it.' }
-    @{ Name = 'Winmgmt';    Display = 'Windows Management Instrumentation'; MustRun = $true; AllowedStart = @('Auto');          Critical = $true;
+    @{ Name = 'Winmgmt';    Display = 'Windows Management Instrumentation'; Class = 'Core'; MustRun = $true; AllowedStart = @('Auto');          Critical = $true;
        Note = 'The client stores all of its state in WMI.' }
-    @{ Name = 'RpcSs';      Display = 'Remote Procedure Call (RPC)';      MustRun = $true;  AllowedStart = @('Auto');           Critical = $true;
+    @{ Name = 'RpcSs';      Display = 'Remote Procedure Call (RPC)';      Class = 'Core'; MustRun = $true;  AllowedStart = @('Auto');           Critical = $true;
        Note = 'WMI and the client agent both depend on RPC.' }
-    @{ Name = 'BITS';       Display = 'Background Intelligent Transfer';  MustRun = $false; AllowedStart = @('Auto', 'Manual'); Critical = $true;
-       Note = 'Downloads all package, application and update content.' }
-    @{ Name = 'wuauserv';   Display = 'Windows Update';                   MustRun = $false; AllowedStart = @('Auto', 'Manual'); Critical = $true;
-       Note = 'Performs the update scan on behalf of the client. Disabling it breaks patching entirely.' }
-    @{ Name = 'CryptSvc';   Display = 'Cryptographic Services';           MustRun = $true;  AllowedStart = @('Auto');           Critical = $true;
+    @{ Name = 'CryptSvc';   Display = 'Cryptographic Services';           Class = 'Core'; MustRun = $true;  AllowedStart = @('Auto');           Critical = $true;
        Note = 'Validates content signatures and client certificates.' }
-    @{ Name = 'msiserver';  Display = 'Windows Installer';                MustRun = $false; AllowedStart = @('Auto', 'Manual'); Critical = $false;
-       Note = 'Required for MSI-based deployments.' }
-    @{ Name = 'Schedule';   Display = 'Task Scheduler';                   MustRun = $true;  AllowedStart = @('Auto');           Critical = $false;
+    @{ Name = 'Schedule';   Display = 'Task Scheduler';                   Class = 'Core'; MustRun = $true;  AllowedStart = @('Auto');           Critical = $false;
        Note = 'Runs the CcmEval client health task.' }
-    @{ Name = 'gpsvc';      Display = 'Group Policy Client';              MustRun = $true;  AllowedStart = @('Auto');           Critical = $false;
+    @{ Name = 'gpsvc';      Display = 'Group Policy Client';              Class = 'Core'; MustRun = $true;  AllowedStart = @('Auto');           Critical = $false;
        Note = 'Applies Group Policy; also how WSUS policy reaches the client.' }
-    @{ Name = 'Dnscache';   Display = 'DNS Client';                       MustRun = $true;  AllowedStart = @('Auto');           Critical = $false;
+    @{ Name = 'Dnscache';   Display = 'DNS Client';                       Class = 'Core'; MustRun = $true;  AllowedStart = @('Auto');           Critical = $false;
        Note = 'Resolves the management point and distribution point names.' }
-    @{ Name = 'W32Time';    Display = 'Windows Time';                     MustRun = $false; AllowedStart = @('Auto', 'Manual'); Critical = $false;
-       Note = 'Clock skew breaks certificate validation and Kerberos.' }
-    @{ Name = 'TrustedInstaller'; Display = 'Windows Modules Installer';  MustRun = $false; AllowedStart = @('Auto', 'Manual'); Critical = $false;
-       Note = 'Installs Windows updates. Disabled means no CU will ever apply.' }
+
+    # ---- conditional Windows services --------------------------------------
+    # Each of these is legitimately Manual, Auto or Disabled depending on how
+    # the environment is built, so only "Disabled" is even considered, and only
+    # then when something else in the diagnosis actually points at it.
+    @{ Name = 'BITS';       Display = 'Background Intelligent Transfer';  Class = 'Conditional'; MustRun = $false; AllowedStart = @('Auto', 'Manual');
+       Note = 'Downloads all package, application and update content.'
+       Needs = 'content or update downloads are failing'
+       Correlate = {
+           param($Findings)
+           @($Findings | Where-Object {
+               $_.Status -in @('Warn', 'Fail') -and (
+                   $_.Category -eq 'Content' -or
+                   ($_.Category -eq 'Logs' -and $_.Title -match '^(Content|Updates) logs$')
+               )
+           })
+       } }
+    @{ Name = 'wuauserv';   Display = 'Windows Update';                   Class = 'Conditional'; MustRun = $false; AllowedStart = @('Auto', 'Manual');
+       Note = 'Performs the update scan on behalf of the client. Disabling it breaks patching entirely.'
+       Needs = 'software update scans or installs are failing'
+       Correlate = {
+           param($Findings)
+           @($Findings | Where-Object {
+               $_.Status -in @('Warn', 'Fail') -and (
+                   $_.Category -eq 'Updates' -or
+                   ($_.Category -eq 'Logs' -and $_.Title -eq 'Updates logs')
+               )
+           })
+       } }
+    @{ Name = 'msiserver';  Display = 'Windows Installer';                Class = 'Conditional'; MustRun = $false; AllowedStart = @('Auto', 'Manual');
+       Note = 'Required for MSI-based deployments.'
+       Needs = 'an MSI-based deployment is failing'
+       Correlate = {
+           param($Findings)
+           @($Findings | Where-Object {
+               $_.Status -in @('Warn', 'Fail') -and
+               $_.Category -eq 'Logs' -and $_.Title -match '^(Software|Install) logs$'
+           })
+       } }
+    @{ Name = 'W32Time';    Display = 'Windows Time';                     Class = 'Conditional'; MustRun = $false; AllowedStart = @('Auto', 'Manual');
+       Note = 'Clock skew breaks certificate validation and Kerberos.'
+       Needs = 'certificate validation or clock skew is already causing failures'
+       Correlate = {
+           param($Findings)
+           @($Findings | Where-Object {
+               $_.Status -in @('Warn', 'Fail') -and (
+                   $_.Category -eq 'Certificates' -or
+                   $_.Title -eq 'Time synchronisation' -or
+                   ($_.Category -eq 'Logs' -and $_.Title -eq 'Certificates logs')
+               )
+           })
+       } }
+    @{ Name = 'TrustedInstaller'; Display = 'Windows Modules Installer';  Class = 'Conditional'; MustRun = $false; AllowedStart = @('Auto', 'Manual');
+       Note = 'Installs Windows updates. Disabled means no CU will ever apply.'
+       Needs = 'Windows update installs are failing'
+       Correlate = {
+           param($Findings)
+           @($Findings | Where-Object {
+               $_.Status -in @('Warn', 'Fail') -and (
+                   ($_.Category -eq 'Updates' -and $_.Title -match '(?i)stuck|install') -or
+                   ($_.Category -eq 'Logs' -and $_.Title -eq 'Updates logs')
+               )
+           })
+       } }
 )
 
 # CCM_SoftwareUpdate.EvaluationState -> human meaning.
@@ -208,6 +278,23 @@ function Test-MDClientInstall {
 #  3. SERVICES
 # ===========================================================================
 function Test-MDServices {
+<#
+    .SYNOPSIS
+        Reports the state and start mode of every service the client can
+        depend on, and decides which of them are actually repairable.
+    .DESCRIPTION
+        Core services get a repair attached immediately - a stopped CcmExec or
+        a disabled Winmgmt is unambiguous.
+
+        Conditional services do not. A disabled msiserver, W32Time or wuauserv
+        is reported, but no repair is proposed here: whether it matters depends
+        on whether anything else in the diagnosis is failing because of it.
+        Resolve-MDServiceCorrelation makes that call once every other check has
+        run.
+
+        Each finding carries the service name in Data so the repair engine can
+        act on exactly the service that was implicated and nothing else.
+#>
     [CmdletBinding()]
     param()
 
@@ -220,12 +307,16 @@ function Test-MDServices {
 
         if (-not $svc) {
             # Some of these are genuinely absent on Server Core / stripped images.
-            $status = if ($spec.Critical) { 'Fail' } else { 'Skip' }
+            $status = 'Skip'
+            $repair = @()
+            if ($spec.Class -eq 'Core' -and $spec.Critical) { $status = 'Fail'; $repair = @($script:MDRepairIds.ClientReinstall) }
+
             $findings += New-MDFinding -Category 'Services' -Title $spec.Display -Status $status `
                 -Detail ('service "{0}" is not installed' -f $spec.Name) `
                 -Evidence @($spec.Note) `
-                -Remediation 'A missing CcmExec means no client; a missing Windows service means an image problem that needs OS repair.' `
-                -RepairIds @($script:MDRepairIds.ClientReinstall)
+                -Remediation $(if ($status -eq 'Fail') { 'A missing CcmExec means no client; a missing Windows service means an image problem that needs OS repair.' } else { '' }) `
+                -RepairIds $repair `
+                -Data @{ Service = $spec.Name; Class = $spec.Class; Present = $false }
             $rows += [pscustomobject]@{ Service = $spec.Name; Display = $spec.Display; State = 'ABSENT'; StartMode = '-'; Verdict = $status.ToUpperInvariant() }
             continue
         }
@@ -234,23 +325,49 @@ function Test-MDServices {
         if ($spec.MustRun -and $svc.Status -ne 'Running') {
             $problems += ('is {0} but must be Running' -f $svc.Status)
         }
-        if ($start -and ($spec.AllowedStart -notcontains $start)) {
-            $problems += ('start mode is {0}, expected {1}' -f $start, ($spec.AllowedStart -join ' or '))
+
+        if ($spec.Class -eq 'Core') {
+            # A core service is held to the full specification.
+            if ($start -and ($spec.AllowedStart -notcontains $start)) {
+                $problems += ('start mode is {0}, expected {1}' -f $start, ($spec.AllowedStart -join ' or '))
+            }
         }
+        else {
+            # A conditional service is only ever questioned when it has been
+            # switched off outright. Auto vs Manual is an environment choice,
+            # not a fault, and normalising it would be pure churn.
+            if ($start -eq 'Disabled') {
+                $problems += 'start mode is Disabled'
+            }
+        }
+
+        $data = @{ Service = $spec.Name; Class = $spec.Class; Present = $true; State = "$($svc.Status)"; StartMode = "$start"; Problems = $problems }
 
         if ($problems.Count -eq 0) {
             $findings += New-MDFinding -Category 'Services' -Title $spec.Display -Status 'Pass' `
-                -Detail ('{0} / {1}' -f $svc.Status, $start)
+                -Detail ('{0} / {1}' -f $svc.Status, $start) -Data $data
             $rows += [pscustomobject]@{ Service = $spec.Name; Display = $spec.Display; State = "$($svc.Status)"; StartMode = "$start"; Verdict = 'OK' }
+            continue
         }
-        else {
+
+        if ($spec.Class -eq 'Core') {
             $status = if ($spec.Critical) { 'Fail' } else { 'Warn' }
             $findings += New-MDFinding -Category 'Services' -Title $spec.Display -Status $status `
                 -Detail ($problems -join '; ') `
                 -Evidence @($spec.Note) `
-                -Remediation ('Run: mecmdoctor repair -Level Safe  (starts the service and corrects its start mode). If a GPO is disabling {0}, fix the policy first or it will revert.' -f $spec.Name) `
-                -RepairIds @($script:MDRepairIds.ServicesFix)
-            $rows += [pscustomobject]@{ Service = $spec.Name; Display = $spec.Display; State = "$($svc.Status)"; StartMode = "$start"; Verdict = $status.ToUpper() }
+                -Remediation ('Run: mecmdoctor repair -Level Safe  (starts {0} and corrects its start mode, and touches no other service). If a GPO is disabling it, fix the policy first or it will revert.' -f $spec.Name) `
+                -RepairIds @($script:MDRepairIds.ServicesFix) -Data $data
+            $rows += [pscustomobject]@{ Service = $spec.Name; Display = $spec.Display; State = "$($svc.Status)"; StartMode = "$start"; Verdict = $status.ToUpperInvariant() }
+        }
+        else {
+            # Recorded, not repaired. Resolve-MDServiceCorrelation promotes this
+            # to a repairable finding only if something is failing because of it.
+            $findings += New-MDFinding -Category 'Services' -Title $spec.Display -Status 'Warn' `
+                -Detail (($problems -join '; ') + ' - not repaired unless it is causing a failure') `
+                -Evidence @($spec.Note,
+                            ('This only matters when {0}. Nothing else in the diagnosis has been correlated with it yet.' -f $spec.Needs)) `
+                -Severity 1 -Data $data
+            $rows += [pscustomobject]@{ Service = $spec.Name; Display = $spec.Display; State = "$($svc.Status)"; StartMode = "$start"; Verdict = 'NOTE' }
         }
     }
 
@@ -265,21 +382,196 @@ function Test-MDServices {
         @{ Header = 'VERDICT';    Property = 'Verdict';   Width = 7 }
     ) -RowColor {
         param($r)
-        switch ($r.Verdict) { 'OK' { 'Green' } 'WARN' { 'Yellow' } 'SKIP' { 'DarkGray' } default { 'Red' } }
+        switch ($r.Verdict) { 'OK' { 'Green' } 'WARN' { 'Yellow' } 'NOTE' { 'Yellow' } 'SKIP' { 'DarkGray' } default { 'Red' } }
     }
 
     $findings
 }
 
 
+function Resolve-MDServiceCorrelation {
+<#
+    .SYNOPSIS
+        Decides whether a disabled conditional service is the cause of a real
+        problem, or simply how this machine is built.
+    .DESCRIPTION
+        Runs after every other check, because that is the earliest point at
+        which the question can honestly be answered. For each conditional
+        service that is disabled, the spec's Correlate block is handed the
+        whole finding set and returns whatever is failing in a way consistent
+        with it.
+
+          msiserver disabled + an MSI deployment failure  -> repair
+          msiserver disabled + nothing MSI-related        -> information only
+
+        Findings that correlate are promoted in place: status raised, the
+        matching symptoms recorded as evidence, and services.fix attached with
+        the service name in Data so the repair touches only that service.
+    .OUTPUTS
+        The same finding set, with any promotions applied.
+#>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] $Findings)
+
+    $all         = @($Findings)
+    $conditional = @($all | Where-Object {
+        $_.Category -eq 'Services' -and $_.Data -and $_.Data.Class -eq 'Conditional' -and
+        $_.Data.Problems -and @($_.Data.Problems).Count -gt 0
+    })
+
+    if ($conditional.Count -eq 0) {
+        Write-MDOk 'No conditional Windows service is misconfigured, so there is nothing to correlate.'
+        return $all
+    }
+
+    foreach ($finding in $conditional) {
+        $spec = $script:MDRequiredServices | Where-Object { $_.Name -eq $finding.Data.Service } | Select-Object -First 1
+        if (-not $spec -or -not $spec.Correlate) { continue }
+
+        # A service finding must not count as its own justification, so the
+        # whole Services category is withheld from the correlation.
+        $others   = @($all | Where-Object { $_.Category -ne 'Services' })
+        $symptoms = @(& $spec.Correlate $others)
+
+        if ($symptoms.Count -eq 0) {
+            Write-MDInfo ('{0}: {1}, but nothing in this diagnosis depends on it. No repair proposed.' -f
+                          $spec.Name, ($finding.Data.Problems -join '; '))
+            $finding.Status      = 'Info'
+            $finding.Severity    = 0
+            $finding.Detail      = ('{0} - no correlated failure, so this is a configuration choice rather than a fault' -f ($finding.Data.Problems -join '; '))
+            $finding.Remediation = ''
+            continue
+        }
+
+        $lines = @($symptoms | Select-Object -First 4 | ForEach-Object { '{0}: {1} -- {2}' -f $_.Category, $_.Title, $_.Detail })
+
+        Write-MDFail ('{0}: {1}, and {2} failing check(s) are consistent with that.' -f
+                      $spec.Name, ($finding.Data.Problems -join '; '), $symptoms.Count)
+        Write-MDDetail -Text $lines -Bullet '- '
+
+        $finding.Status      = 'Fail'
+        $finding.Severity    = 3
+        $finding.Detail      = ('{0} - correlated with {1} failing check(s)' -f ($finding.Data.Problems -join '; '), $symptoms.Count)
+        $finding.Evidence    = @($spec.Note, ('{0} matters here because {1}:' -f $spec.Name, $spec.Needs)) + $lines
+        $finding.Remediation = ('Run: mecmdoctor repair -Level Safe  (re-enables and starts {0} only - no other service is touched). If a GPO disabled it, fix the policy first or it will revert.' -f $spec.Name)
+        $finding.RepairIds   = @($script:MDRepairIds.ServicesFix)
+    }
+
+    $all
+}
+
+
 # ===========================================================================
 #  4. WMI HEALTH
 # ===========================================================================
+function Test-MDWmiDeepHealth {
+<#
+    .SYNOPSIS
+        Second-opinion WMI checks, run only when the repository is already
+        under suspicion.
+    .DESCRIPTION
+        winmgmt /verifyrepository is the headline signal, but on its own it is
+        not enough to justify a repository reset: it reports "inconsistent" for
+        conditions that a salvage clears in seconds, and it says nothing at all
+        about whether WMI is usable right now.
+
+        These checks answer the question a reset actually depends on - is the
+        repository damaged in a way that stops WMI working - by exercising it
+        from several independent angles. Each one that fails is a corroborating
+        signal; none of them alone is proof.
+    .OUTPUTS
+        [pscustomobject[]] Check / Ok / Detail
+#>
+    [CmdletBinding()]
+    param()
+
+    $signals = @()
+
+    # --- can the service even run -------------------------------------------
+    $winmgmt = Get-MDService -Name 'Winmgmt'
+    $signals += [pscustomobject]@{
+        Check  = 'Winmgmt service'
+        Ok     = ($winmgmt -and $winmgmt.Status -eq 'Running')
+        Detail = $(if ($winmgmt) { 'service is ' + $winmgmt.Status } else { 'service is not installed' })
+    }
+
+    # --- the two namespaces every provider is built on ----------------------
+    # A repository that cannot answer for root\cimv2 or root\default is broken
+    # in the way that a reset exists to fix.
+    foreach ($probe in @(
+        @{ Namespace = 'root\cimv2';   Class = 'Win32_ComputerSystem'; What = 'core OS namespace' }
+        @{ Namespace = 'root\default'; Class = '__Namespace';          What = 'default namespace' }
+    )) {
+        $r = Invoke-MDCimQuery -Namespace $probe.Namespace -ClassName $probe.Class
+        $signals += [pscustomobject]@{
+            Check  = ('{0} readable' -f $probe.Namespace)
+            Ok     = ($null -ne $r)
+            Detail = $(if ($null -ne $r) { '{0} answered' -f $probe.What }
+                       else { '{0} did not answer: {1}' -f $probe.What, $(if ($script:MDLastCimError) { $script:MDLastCimError.Exception.Message } else { 'query failed' }) })
+        }
+    }
+
+    # --- class definitions, not just instances ------------------------------
+    # Instance queries can succeed against a repository whose class definitions
+    # are damaged. Reading the schema is the check that catches that.
+    $classOk     = $true
+    $classDetail = 'Win32_Service and Win32_OperatingSystem definitions read cleanly'
+    try {
+        foreach ($cls in @('Win32_Service', 'Win32_OperatingSystem')) {
+            $null = Get-CimClass -Namespace 'root\cimv2' -ClassName $cls -ErrorAction Stop
+        }
+    }
+    catch {
+        $classOk     = $false
+        $classDetail = 'class definitions could not be read: ' + $_.Exception.Message
+    }
+    $signals += [pscustomobject]@{ Check = 'Class definitions'; Ok = $classOk; Detail = $classDetail }
+
+    # --- namespace tree enumeration -----------------------------------------
+    # Walking root\__NAMESPACE touches the repository index rather than any one
+    # provider, so a failure here is structural.
+    $nsOk     = $true
+    $nsDetail = ''
+    try {
+        $children = @(Get-CimInstance -Namespace 'root' -ClassName '__Namespace' -ErrorAction Stop)
+        $nsDetail = '{0} child namespace(s) enumerated under root' -f $children.Count
+        if ($children.Count -eq 0) { $nsOk = $false; $nsDetail = 'root reports no child namespaces at all' }
+    }
+    catch {
+        $nsOk     = $false
+        $nsDetail = 'root\__Namespace could not be enumerated: ' + $_.Exception.Message
+    }
+    $signals += [pscustomobject]@{ Check = 'Namespace tree'; Ok = $nsOk; Detail = $nsDetail }
+
+    $signals
+}
+
+
 function Test-MDWmiHealth {
+<#
+    .SYNOPSIS
+        Reports on the WMI repository, and decides - carefully - whether it is
+        genuinely corrupt.
+    .DESCRIPTION
+        Repository size is deliberately NOT treated as evidence of corruption.
+        A large OBJECTS.DATA is worth knowing about and worth investigating,
+        but on its own it is a perfectly healthy repository that has seen a lot
+        of MOF churn, and resetting it would discard every custom WMI class on
+        the machine for no reason at all.
+
+        A repository reset is only ever proposed when winmgmt itself reports
+        the repository inconsistent AND at least one independent health check
+        agrees. Even then, salvage is proposed first and the reset carries its
+        own explanation and its own confirmation.
+#>
     [CmdletBinding()]
     param([Parameter(Mandatory)] $ClientInfo)
 
     $findings = @()
+
+    # Corroborating evidence, collected as we go and weighed up at the end.
+    $inconsistent   = $false
+    $corroborating  = @()
 
     # --- repository consistency --------------------------------------------
     Write-MDAction 'Running: winmgmt /verifyrepository'
@@ -288,6 +580,8 @@ function Test-MDWmiHealth {
     $verifyText = (($verify.StdOut + ' ' + $verify.StdErr)).Trim()
 
     if ($verify.TimedOut) {
+        $inconsistent  = $true
+        $corroborating += 'winmgmt itself did not respond within 120 seconds'
         $findings += New-MDFinding -Category 'WMI' -Title 'Repository consistency' -Status 'Fail' `
             -Detail 'winmgmt /verifyrepository did not return within 120s' `
             -Remediation 'WMI is hung. Restart the Winmgmt service, then re-run. If it hangs again, reboot before repairing.' `
@@ -304,10 +598,11 @@ function Test-MDWmiHealth {
             -Evidence @($verifyText, 'This check needs an elevated session. Re-run via mecmdoctor.bat.')
     }
     else {
+        $inconsistent = $true
         $findings += New-MDFinding -Category 'WMI' -Title 'Repository consistency' -Status 'Fail' `
             -Detail ('inconsistent (exit {0})' -f $verify.ExitCode) `
             -Evidence @($verifyText) `
-            -Remediation 'Run: mecmdoctor repair -Level Standard  (salvages the repository). Only use -Level Aggressive, which resets it outright, if salvage fails.' `
+            -Remediation 'Run: mecmdoctor repair -Level Standard  (salvages the repository, which is non-destructive and fixes most inconsistencies).' `
             -RepairIds @($script:MDRepairIds.WmiSalvage) -Severity 4
     }
 
@@ -315,14 +610,14 @@ function Test-MDWmiHealth {
     # Ordered from "the OS is fine" outwards to the client-specific namespaces,
     # so the first failure tells you how deep the damage goes.
     $namespaces = @(
-        @{ Namespace = 'root\cimv2';                          Class = 'Win32_OperatingSystem'; Critical = $true;  What = 'core OS namespace' }
-        @{ Namespace = 'root\ccm';                            Class = 'SMS_Client';            Critical = $true;  What = 'client agent namespace' }
-        @{ Namespace = 'root\ccm\ClientSDK';                  Class = 'CCM_ClientUtilities';   Critical = $true;  What = 'client SDK (used by every management script)' }
-        @{ Namespace = 'root\ccm\Policy\Machine\ActualConfig';Class = 'CCM_Policy_Policy5';    Critical = $true;  What = 'applied machine policy' }
-        @{ Namespace = 'root\ccm\SoftwareUpdates\UpdatesStore';Class = 'CCM_UpdateStatus';     Critical = $false; What = 'software update compliance store' }
-        @{ Namespace = 'root\ccm\SoftMgmtAgent';              Class = 'CacheConfig';           Critical = $false; What = 'content cache configuration' }
-        @{ Namespace = 'root\ccm\InvAgt';                     Class = 'InventoryActionStatus'; Critical = $false; What = 'inventory agent state' }
-        @{ Namespace = 'root\ccm\Scheduler';                  Class = 'CCM_Scheduler_History'; Critical = $false; What = 'client schedule history' }
+        @{ Namespace = 'root\cimv2';                          Class = 'Win32_OperatingSystem'; Critical = $true;  Os = $true;  What = 'core OS namespace' }
+        @{ Namespace = 'root\ccm';                            Class = 'SMS_Client';            Critical = $true;  Os = $false; What = 'client agent namespace' }
+        @{ Namespace = 'root\ccm\ClientSDK';                  Class = 'CCM_ClientUtilities';   Critical = $true;  Os = $false; What = 'client SDK (used by every management script)' }
+        @{ Namespace = 'root\ccm\Policy\Machine\ActualConfig';Class = 'CCM_Policy_Policy5';    Critical = $true;  Os = $false; What = 'applied machine policy' }
+        @{ Namespace = 'root\ccm\SoftwareUpdates\UpdatesStore';Class = 'CCM_UpdateStatus';     Critical = $false; Os = $false; What = 'software update compliance store' }
+        @{ Namespace = 'root\ccm\SoftMgmtAgent';              Class = 'CacheConfig';           Critical = $false; Os = $false; What = 'content cache configuration' }
+        @{ Namespace = 'root\ccm\InvAgt';                     Class = 'InventoryActionStatus'; Critical = $false; Os = $false; What = 'inventory agent state' }
+        @{ Namespace = 'root\ccm\Scheduler';                  Class = 'CCM_Scheduler_History'; Critical = $false; Os = $false; What = 'client schedule history' }
     )
 
     foreach ($ns in $namespaces) {
@@ -359,6 +654,11 @@ function Test-MDWmiHealth {
                 if ($translated.Fix) { $fix = $translated.Fix }
             }
 
+            # A failing OS namespace implicates the repository itself. A failing
+            # root\ccm namespace usually implicates the client, which is why it
+            # is not counted as evidence of repository corruption.
+            if ($ns.Os) { $corroborating += ('{0} is not readable' -f $ns.Namespace) }
+
             $status = if ($ns.Critical) { 'Fail' } else { 'Warn' }
             $repair = @($script:MDRepairIds.WmiSalvage)
             if ($ns.Namespace -like 'root\ccm*') { $repair += $script:MDRepairIds.ClientRepair }
@@ -366,24 +666,6 @@ function Test-MDWmiHealth {
             $findings += New-MDFinding -Category 'WMI' -Title ('Namespace ' + $ns.Namespace) -Status $status `
                 -Detail 'not readable' -Evidence $evidence -Remediation $fix -RepairIds $repair `
                 -Severity $(if ($ns.Critical) { 4 } else { 2 })
-        }
-    }
-
-    # --- repository size ----------------------------------------------------
-    # A repository that has grown past a gigabyte is nearly always about to
-    # fail, or already failing intermittently.
-    $objectsData = Join-Path $env:windir 'System32\wbem\Repository\OBJECTS.DATA'
-    if (Test-Path -LiteralPath $objectsData) {
-        $size = (Get-Item -LiteralPath $objectsData).Length
-        if ($size -gt 1GB) {
-            $findings += New-MDFinding -Category 'WMI' -Title 'Repository size' -Status 'Warn' `
-                -Detail (Format-MDBytes $size) `
-                -Evidence @('A repository this large is usually the result of years of MOF churn and tends to fail intermittently.') `
-                -Remediation 'Plan a repository reset (mecmdoctor repair -Level Aggressive) during a maintenance window, followed by a client repair.' `
-                -RepairIds @($script:MDRepairIds.WmiReset)
-        }
-        else {
-            $findings += New-MDFinding -Category 'WMI' -Title 'Repository size' -Status 'Pass' -Detail (Format-MDBytes $size)
         }
     }
 
@@ -460,11 +742,100 @@ function Test-MDWmiHealth {
             -Detail 'WMI-Activity/Operational log unavailable or unreadable'
     }
 
+    # --- repository size ----------------------------------------------------
+    # Reported, never repaired. Size is a reason to look, not a reason to reset.
+    $objectsData = Join-Path $env:windir 'System32\wbem\Repository\OBJECTS.DATA'
+    $oversized   = $false
+    $sizeText    = 'unknown'
+
+    if (Test-Path -LiteralPath $objectsData) {
+        $size     = (Get-Item -LiteralPath $objectsData).Length
+        $sizeText = Format-MDBytes $size
+        $oversized = ($size -gt 1GB)
+    }
+
+    # --- deeper health checks ------------------------------------------------
+    # Only worth the seconds they cost when something already looks wrong.
+    $deep = @()
+    if ($inconsistent -or $oversized) {
+        Write-MDAction 'Repository is suspect - running additional WMI health checks'
+        $deep = @(Test-MDWmiDeepHealth)
+
+        foreach ($signal in ($deep | Where-Object { -not $_.Ok })) {
+            $corroborating += ('{0}: {1}' -f $signal.Check, $signal.Detail)
+        }
+
+        $deepPassed = @($deep | Where-Object { $_.Ok })
+        $findings += New-MDFinding -Category 'WMI' -Title 'WMI health checks' `
+            -Status $(if ($deepPassed.Count -eq @($deep).Count) { 'Pass' } else { 'Fail' }) `
+            -Detail ('{0} of {1} check(s) passed' -f $deepPassed.Count, @($deep).Count) `
+            -Evidence (@($deep | ForEach-Object { '{0}: {1} -- {2}' -f $(if ($_.Ok) { 'ok  ' } else { 'FAIL' }), $_.Check, $_.Detail })) `
+            -Severity $(if ($deepPassed.Count -eq @($deep).Count) { 0 } else { 3 })
+    }
+
+    # Only failures that are about the repository itself count. Anything raised
+    # by the /verifyrepository timeout is already reflected in $inconsistent.
+    $corroborating = @($corroborating | Select-Object -Unique)
+    $confirmed     = ($inconsistent -and $corroborating.Count -gt 0)
+
+    if (Test-Path -LiteralPath $objectsData) {
+        if ($oversized -and -not $confirmed) {
+            # The headline case this tool used to get wrong. No repair id, so
+            # nothing downstream can turn this into a reset.
+            $findings += New-MDFinding -Category 'WMI' -Title 'Repository size' -Status 'Warn' `
+                -Detail ('{0} - unusually large, but no corruption was detected. No repair recommended.' -f $sizeText) `
+                -Evidence @(
+                    'A repository this size is normally the result of years of MOF churn from inventory, third-party agents and servicing.'
+                    'Size on its own is not corruption, and resetting the repository because of it would discard every custom WMI class on this machine for no benefit.'
+                    $(if ($deep.Count) { '{0} additional WMI health check(s) all passed.' -f @($deep).Count } else { '' })
+                ) `
+                -Remediation 'Worth investigating rather than repairing: look for an agent re-registering its MOFs on a loop, and plan a rebuild during a maintenance window only if WMI actually starts failing.' `
+                -Severity 1
+        }
+        elseif ($oversized) {
+            $findings += New-MDFinding -Category 'WMI' -Title 'Repository size' -Status 'Warn' `
+                -Detail ('{0} - large, and corruption has been detected separately' -f $sizeText) `
+                -Evidence @('The size is context, not the diagnosis. See the WMI corruption assessment below for what is actually being proposed.') `
+                -Severity 1
+        }
+        else {
+            $findings += New-MDFinding -Category 'WMI' -Title 'Repository size' -Status 'Pass' -Detail $sizeText
+        }
+    }
+
+    # --- corruption assessment ----------------------------------------------
+    # The single place in the whole tool that can propose a repository reset.
+    if ($confirmed) {
+        $findings += New-MDFinding -Category 'WMI' -Title 'WMI corruption assessment' -Status 'Fail' `
+            -Detail ('repository reports inconsistent and {0} independent check(s) agree' -f $corroborating.Count) `
+            -Evidence (@('winmgmt /verifyrepository does not report the repository as consistent.') + $corroborating +
+                       @('Salvage runs first and is non-destructive. A reset is only attempted if salvage leaves the repository inconsistent, and it prompts separately before it does anything.')) `
+            -Remediation 'Run: mecmdoctor repair -Level Standard first - salvage alone fixes most of these. If salvage leaves it inconsistent, mecmdoctor repair -Level Aggressive offers the reset, which discards every custom WMI class and needs a client repair and a reboot afterwards.' `
+            -RepairIds @($script:MDRepairIds.WmiSalvage, $script:MDRepairIds.WmiReset) -Severity 4
+    }
+    elseif ($inconsistent) {
+        $findings += New-MDFinding -Category 'WMI' -Title 'WMI corruption assessment' -Status 'Warn' `
+            -Detail 'repository reports inconsistent, but WMI is still answering normally' `
+            -Evidence @('No independent health check failed, so this is very likely to be cleared by a salvage.',
+                        'A repository reset is deliberately not proposed on this evidence.') `
+            -Remediation 'Run: mecmdoctor repair -Level Standard  (salvage only).' `
+            -RepairIds @($script:MDRepairIds.WmiSalvage) -Severity 2
+    }
+    elseif ($corroborating.Count -gt 0) {
+        $findings += New-MDFinding -Category 'WMI' -Title 'WMI corruption assessment' -Status 'Warn' `
+            -Detail ('{0} health check(s) failed, but the repository verifies as consistent' -f $corroborating.Count) `
+            -Evidence ($corroborating + 'Without an inconsistent repository this points at a provider or a permissions problem rather than repository damage.') `
+            -Remediation 'Restart the Winmgmt service and re-run the diagnosis. If the same checks fail, salvage the repository: mecmdoctor repair -Level Standard' `
+            -RepairIds @($script:MDRepairIds.WmiSalvage) -Severity 2
+    }
+    else {
+        $findings += New-MDFinding -Category 'WMI' -Title 'WMI corruption assessment' -Status 'Pass' `
+            -Detail 'no evidence of repository corruption'
+    }
+
     $findings | Write-MDFinding
     $findings
 }
-
-
 # ===========================================================================
 #  5. CLIENT REGISTRATION
 # ===========================================================================
@@ -488,23 +859,30 @@ function Test-MDClientRegistration {
         $findings += New-MDFinding -Category 'Registration' -Title 'Assigned site code' -Status 'Fail' `
             -Detail 'the client is not assigned to a site' `
             -Evidence @('HKLM:\SOFTWARE\Microsoft\SMS\Mobile Client\AssignedSiteCode is empty and SMS_Authority returned nothing.') `
-            -Remediation 'Check AD site/boundary configuration, then force site assignment. If it stays unassigned, re-register or reinstall with SMSSITECODE set.' `
-            -RepairIds @($script:MDRepairIds.Reregister) -Severity 4
+            -Remediation 'This is a site-side problem before it is a client-side one: check AD site, boundary and boundary group configuration, then force a machine policy retrieval. If it stays unassigned, reinstall with SMSSITECODE set.' `
+            -RepairIds @($script:MDRepairIds.PolicyTrigger) -Severity 4
     }
 
     # --- client identity ----------------------------------------------------
+    # A missing GUID is reported, never "fixed". Deleting the client identity to
+    # force a new one orphans every piece of inventory and deployment history
+    # the site holds for this device, so mecmdoctor does not do it: restarting
+    # CcmExec makes the client re-register under the identity it already has.
     if ($ClientInfo.ClientId -and $ClientInfo.ClientId -ne 'GUID:00000000-0000-0000-0000-000000000000') {
         $findings += New-MDFinding -Category 'Registration' -Title 'Client ID' -Status 'Pass' -Detail $ClientInfo.ClientId
     }
     else {
         $findings += New-MDFinding -Category 'Registration' -Title 'Client ID' -Status 'Fail' `
             -Detail 'no client GUID has been assigned' `
-            -Remediation 'Re-register the client: mecmdoctor repair -Level Standard' `
-            -RepairIds @($script:MDRepairIds.Reregister) -Severity 4
+            -Evidence @('The client has never completed registration with the site, so it has no identity to work with.') `
+            -Remediation 'Restart CcmExec so the client retries registration, then check ClientIDManagerStartup.log: mecmdoctor repair -Level Safe' `
+            -RepairIds @($script:MDRepairIds.CcmRestart) -Severity 4
     }
 
     # SMSCFG.INI holds the persisted identity. Its absence on an otherwise
-    # installed client means registration never completed.
+    # installed client means registration never completed. It is never deleted
+    # by this tool - the client rebuilds it during registration, and removing it
+    # by hand is what produces a brand new GUID.
     $smscfg = Join-Path $env:windir 'SMSCFG.INI'
     if (Test-Path -LiteralPath $smscfg) {
         $findings += New-MDFinding -Category 'Registration' -Title 'SMSCFG.INI' -Status 'Pass' `
@@ -513,8 +891,8 @@ function Test-MDClientRegistration {
     else {
         $findings += New-MDFinding -Category 'Registration' -Title 'SMSCFG.INI' -Status 'Warn' `
             -Detail 'missing - the client has no persisted identity' `
-            -Remediation 'Restart CcmExec; the client will re-register and recreate it. If it does not reappear, re-register explicitly.' `
-            -RepairIds @($script:MDRepairIds.Reregister)
+            -Remediation 'Restart CcmExec; the client registers and recreates the file by itself: mecmdoctor repair -Level Safe' `
+            -RepairIds @($script:MDRepairIds.CcmRestart)
     }
 
     # --- registration confirmed in the log ----------------------------------
@@ -537,8 +915,8 @@ function Test-MDClientRegistration {
                 $findings += New-MDFinding -Category 'Registration' -Title 'Registration confirmed' -Status 'Fail' `
                     -Detail 'ClientIDManagerStartup.log shows no successful registration' `
                     -Evidence $ev `
-                    -Remediation 'Re-register the client: mecmdoctor repair -Level Standard' `
-                    -RepairIds @($script:MDRepairIds.Reregister) -Severity 4
+                    -Remediation 'Restart CcmExec so registration is retried, then follow ClientIDManagerStartup.log and CcmMessaging.log: mecmdoctor repair -Level Safe' `
+                    -RepairIds @($script:MDRepairIds.CcmRestart, $script:MDRepairIds.PolicyTrigger) -Severity 4
             }
         }
     }
@@ -667,11 +1045,15 @@ function Test-MDCertificates {
     try {
         $smsCerts = @(Get-ChildItem -Path 'Cert:\LocalMachine\SMS' -ErrorAction Stop)
 
+        # Certificates are reported, never deleted. The client reissues its own
+        # self-signed certificate when it needs one; clearing the store by hand
+        # is part of an identity reset, which this tool deliberately does not do.
         if ($smsCerts.Count -eq 0) {
             $findings += New-MDFinding -Category 'Certificates' -Title 'SMS certificate store' -Status 'Fail' `
                 -Detail 'store is empty - the client has no identity certificate' `
-                -Remediation 'Re-register the client so it generates a new self-signed certificate: mecmdoctor repair -Level Standard' `
-                -RepairIds @($script:MDRepairIds.Reregister) -Severity 4
+                -Evidence @('The client generates a self-signed certificate during registration, so an empty store means registration has never succeeded.') `
+                -Remediation 'Restart CcmExec so the client reissues its certificate during registration, then read CertificateMaintenance.log: mecmdoctor repair -Level Safe' `
+                -RepairIds @($script:MDRepairIds.CcmRestart) -Severity 4
         }
         else {
             $expired  = @($smsCerts | Where-Object { $_.NotAfter -lt (Get-Date) })
@@ -681,14 +1063,14 @@ function Test-MDCertificates {
                 $findings += New-MDFinding -Category 'Certificates' -Title 'SMS certificate store' -Status 'Fail' `
                     -Detail ('{0} of {1} certificate(s) expired' -f $expired.Count, $smsCerts.Count) `
                     -Evidence (@($expired | ForEach-Object { '{0} expired {1:yyyy-MM-dd}' -f $_.Subject, $_.NotAfter })) `
-                    -Remediation 'Re-register the client to reissue its certificate: mecmdoctor repair -Level Standard' `
-                    -RepairIds @($script:MDRepairIds.Reregister) -Severity 4
+                    -Remediation 'Restart CcmExec; the client renews an expired self-signed certificate itself. If it does not, check the system clock and CertificateMaintenance.log.' `
+                    -RepairIds @($script:MDRepairIds.CcmRestart) -Severity 4
             }
             elseif ($expiring.Count -gt 0) {
                 $findings += New-MDFinding -Category 'Certificates' -Title 'SMS certificate store' -Status 'Warn' `
                     -Detail ('{0} certificate(s) expire within 30 days' -f $expiring.Count) `
                     -Evidence (@($expiring | ForEach-Object { '{0} expires {1:yyyy-MM-dd}' -f $_.Subject, $_.NotAfter })) `
-                    -Remediation 'The client normally renews these itself. If it does not, re-register.'
+                    -Remediation 'The client normally renews these itself. Watch CertificateMaintenance.log as the date approaches.'
             }
             else {
                 $findings += New-MDFinding -Category 'Certificates' -Title 'SMS certificate store' -Status 'Pass' `
@@ -702,8 +1084,9 @@ function Test-MDCertificates {
             if ($noKey.Count -gt 0) {
                 $findings += New-MDFinding -Category 'Certificates' -Title 'Private keys' -Status 'Fail' `
                     -Detail ('{0} certificate(s) have no accessible private key' -f $noKey.Count) `
-                    -Remediation 'Check permissions on C:\ProgramData\Microsoft\Crypto\RSA\MachineKeys, then re-register the client.' `
-                    -RepairIds @($script:MDRepairIds.Reregister) -Severity 4
+                    -Evidence @('Damaged ACLs on the MachineKeys folder are the usual cause, and no amount of client-side repair works around them.') `
+                    -Remediation 'Fix permissions on C:\ProgramData\Microsoft\Crypto\RSA\MachineKeys (SYSTEM and Administrators need full control), then restart CcmExec.' `
+                    -RepairIds @($script:MDRepairIds.CcmRestart) -Severity 4
             }
         }
     }
@@ -890,42 +1273,178 @@ function Test-MDPolicy {
 # ===========================================================================
 #  8. SOFTWARE UPDATES
 # ===========================================================================
-function Test-MDSoftwareUpdates {
+
+# Where the client-side Windows Update policy lives.
+$script:MDWuPolicyKey = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
+
+# "Specify source service for specific classes of Windows Updates", the policy
+# that replaced DisableDualScan at Windows 10 1903 (build 18362). Each value is
+# 0 = Windows Update, 1 = WSUS / Configuration Manager.
+$script:MDScanSourcePolicies = @(
+    @{ Name = 'SetPolicyDrivenUpdateSourceForFeatureUpdates'; What = 'feature updates' }
+    @{ Name = 'SetPolicyDrivenUpdateSourceForQualityUpdates'; What = 'quality updates' }
+    @{ Name = 'SetPolicyDrivenUpdateSourceForDriverUpdates';  What = 'driver updates' }
+    @{ Name = 'SetPolicyDrivenUpdateSourceForOtherUpdates';   What = 'other updates' }
+)
+
+# Windows Update for Business deferral policies. These are what put a client
+# into dual scan in the first place: with none of them configured, the scan
+# source question does not arise at all.
+$script:MDWufbPolicies = @(
+    'DeferFeatureUpdates'
+    'DeferFeatureUpdatesPeriodInDays'
+    'DeferQualityUpdates'
+    'DeferQualityUpdatesPeriodInDays'
+    'BranchReadinessLevel'
+    'DeferUpgrade'
+    'TargetReleaseVersion'
+    'TargetReleaseVersionInfo'
+    'ProductVersion'
+)
+
+# Windows 10 1903. Before this build DisableDualScan is the control that
+# matters; from it onwards the scan source policy takes precedence.
+$script:MDScanSourceMinBuild = 18362
+
+
+function Get-MDUpdateSourceConfig {
+<#
+    .SYNOPSIS
+        Reads everything that decides where this machine scans for updates.
+    .DESCRIPTION
+        Kept separate from the check that judges it so that both the diagnosis
+        and the support bundle report the same values, and so the decision
+        logic can be reasoned about (and tested) without touching the registry.
+    .OUTPUTS
+        [pscustomobject] describing the policy state and which policy model
+        applies to this Windows build.
+#>
     [CmdletBinding()]
-    param([Parameter(Mandatory)] $ClientInfo)
+    param($Release)
 
-    $findings  = @()
-    $stuckRows = @()
+    if (-not $Release) { $Release = Get-MDWindowsRelease }
 
-    # --- WSUS / GPO conflict ------------------------------------------------
-    # This is the number one cause of "the client never patches" and it is
-    # completely invisible unless you go looking for it.
-    $wuPolicy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
-    $wuServer = Get-MDRegValue -Path $wuPolicy -Name 'WUServer'
-    $useWU    = Get-MDRegValue -Path ($wuPolicy + '\AU') -Name 'UseWUServer'
-    $noAuto   = Get-MDRegValue -Path ($wuPolicy + '\AU') -Name 'NoAutoUpdate'
+    $au = $script:MDWuPolicyKey + '\AU'
 
-    if ($wuServer) {
-        Write-MDInfo ("WUServer currently set to: {0}" -f $wuServer)
+    $scanSource = @()
+    foreach ($p in $script:MDScanSourcePolicies) {
+        $v = Get-MDRegValue -Path $script:MDWuPolicyKey -Name $p.Name
+        if ($null -ne $v) {
+            $scanSource += [pscustomobject]@{
+                Name   = $p.Name
+                What   = $p.What
+                Value  = [int]$v
+                Source = $(if ([int]$v -eq 1) { 'WSUS / Configuration Manager' } else { 'Windows Update' })
+            }
+        }
     }
 
-    # Registry.pol is the authority on whether a *GPO* set these values, as
-    # opposed to the MECM client setting them itself (which is normal).
-    $gpoManagesWu = Test-MDRegistryPolContains -Pattern 'WindowsUpdate'
+    $wufb = @()
+    foreach ($name in $script:MDWufbPolicies) {
+        $v = Get-MDRegValue -Path $script:MDWuPolicyKey -Name $name
+        if ($null -ne $v) { $wufb += ('{0} = {1}' -f $name, $v) }
+    }
 
-    if ($gpoManagesWu -and $wuServer) {
+    [pscustomobject]@{
+        Release            = $Release
+        UsesScanSourcePolicy = ($Release.Build -ge $script:MDScanSourceMinBuild)
+        WUServer           = Get-MDRegValue -Path $script:MDWuPolicyKey -Name 'WUServer'
+        WUStatusServer     = Get-MDRegValue -Path $script:MDWuPolicyKey -Name 'WUStatusServer'
+        UseWUServer        = Get-MDRegValue -Path $au -Name 'UseWUServer'
+        NoAutoUpdate       = Get-MDRegValue -Path $au -Name 'NoAutoUpdate'
+        DisableDualScan    = Get-MDRegValue -Path $script:MDWuPolicyKey -Name 'DisableDualScan'
+        ScanSource         = $scanSource
+        WufbPolicies       = $wufb
+        WufbConfigured     = ($wufb.Count -gt 0)
+        GpoManagesWu       = (Test-MDRegistryPolContains -Pattern 'WindowsUpdate')
+    }
+}
+
+
+function Test-MDUpdateSource {
+<#
+    .SYNOPSIS
+        Judges the update source configuration against the Windows build it is
+        actually running on.
+    .DESCRIPTION
+        The old rule - "DisableDualScan is not 1, therefore this is broken" -
+        produces a permanent false positive on Windows 11 and on Windows 10
+        1903 and later, where that policy was superseded by the scan source
+        policy and where a machine with no deferral policies cannot dual scan
+        at all.
+
+        What is reported now:
+
+          * every build      the update source actually in effect, always
+          * build >= 18362   the scan source policy decides. A conflict is only
+                             reported when a policy explicitly sends a class of
+                             updates to Windows Update while ConfigMgr owns
+                             patching, or when deferral policies are set with
+                             no scan source policy to constrain them.
+          * build <  18362   DisableDualScan is still the control that matters,
+                             but it is only relevant when Windows Update for
+                             Business deferral policies are configured. Without
+                             them there is nothing to disable.
+    .OUTPUTS
+        The findings, and the config object as Data on the summary finding.
+#>
+    [CmdletBinding()]
+    param($Config)
+
+    if (-not $Config) { $Config = Get-MDUpdateSourceConfig }
+
+    $findings = @()
+    $release  = $Config.Release
+
+    # --- what is actually configured, stated plainly ------------------------
+    $summary = @()
+    $summary += ('Windows release: {0}' -f $release.Text)
+    $summary += ('Update source policy model: {0}' -f $(if ($Config.UsesScanSourcePolicy) {
+                    'scan source policy (Windows 10 1903 / build 18362 and later)'
+                 } else {
+                    'DisableDualScan (pre-1903 builds)'
+                 }))
+    $summary += ('WUServer: {0}' -f $(if ($Config.WUServer) { $Config.WUServer } else { '(not set)' }))
+    $summary += ('UseWUServer: {0}' -f $(if ($null -ne $Config.UseWUServer) { $Config.UseWUServer } else { '(not set)' }))
+
+    if ($Config.ScanSource.Count -gt 0) {
+        foreach ($s in $Config.ScanSource) { $summary += ('{0}: {1} -> {2}' -f $s.Name, $s.What, $s.Source) }
+    }
+    else {
+        $summary += 'Scan source policy: not configured'
+    }
+
+    $summary += ('DisableDualScan: {0}' -f $(if ($null -ne $Config.DisableDualScan) { $Config.DisableDualScan } else { '(not set)' }))
+    $summary += ('Windows Update for Business deferral policies: {0}' -f $(if ($Config.WufbConfigured) { $Config.WufbPolicies -join ', ' } else { 'none configured' }))
+
+    $sourceText = 'Configuration Manager software update point'
+    if (-not $Config.WUServer) { $sourceText = 'not yet determined (no WUServer written)' }
+
+    $findings += New-MDFinding -Category 'Updates' -Title 'Update source configuration' -Status 'Info' `
+        -Detail ('scanning against: {0}' -f $sourceText) `
+        -Evidence $summary -Data $Config
+
+    if ($Config.WUServer) {
+        Write-MDInfo ("WUServer currently set to: {0}" -f $Config.WUServer)
+    }
+
+    # --- WSUS settings arriving from a GPO ----------------------------------
+    # Registry.pol is the authority on whether a *GPO* set these values, as
+    # opposed to the MECM client setting them itself (which is normal). This
+    # remains the number one cause of "the client never patches".
+    if ($Config.GpoManagesWu -and $Config.WUServer) {
         $findings += New-MDFinding -Category 'Updates' -Title 'WSUS Group Policy conflict' -Status 'Fail' `
             -Detail 'a Group Policy is managing Windows Update settings on a Configuration Manager client' `
             -Evidence @(
-                "WUServer = $wuServer"
-                "UseWUServer = $useWU"
+                "WUServer = $($Config.WUServer)"
+                "UseWUServer = $($Config.UseWUServer)"
                 'Windows Update settings were found inside the machine Registry.pol, meaning they come from a GPO rather than from the MECM client.'
                 'The client overwrites these at every scan, the GPO overwrites them back, and scans fail with 0x87D00692.'
             ) `
             -Remediation 'Remove the WUServer / UseWUServer settings from the GPO. Configuration Manager manages the update source itself. Then reset Windows Update components and rescan.' `
             -RepairIds @($script:MDRepairIds.UpdatesReset, $script:MDRepairIds.UpdatesRescan) -Severity 4
     }
-    elseif ($wuServer) {
+    elseif ($Config.WUServer) {
         $findings += New-MDFinding -Category 'Updates' -Title 'WSUS Group Policy conflict' -Status 'Pass' `
             -Detail 'update source is set locally (expected for a MECM client)'
     }
@@ -934,19 +1453,82 @@ function Test-MDSoftwareUpdates {
             -Detail 'no WUServer configured yet - normal before the first successful scan'
     }
 
-    if ($noAuto -eq 1) {
+    if ($Config.NoAutoUpdate -eq 1) {
         $findings += New-MDFinding -Category 'Updates' -Title 'NoAutoUpdate policy' -Status 'Info' `
             -Detail 'automatic updates disabled by policy (normal when MECM owns patching)'
     }
 
-    # Dual scan sends the client to Windows Update online instead of the SUP.
-    $dualScan = Get-MDRegValue -Path $wuPolicy -Name 'DisableDualScan'
-    if ($gpoManagesWu -and $dualScan -ne 1) {
-        $findings += New-MDFinding -Category 'Updates' -Title 'Dual scan' -Status 'Warn' `
-            -Detail 'DisableDualScan is not set while Windows Update policy is GPO-managed' `
-            -Evidence @('Without it, the client can scan against Microsoft Update instead of your software update point, producing updates MECM knows nothing about.') `
-            -Remediation 'Set "Do not allow update deferral policies to cause scans against Windows Update" (DisableDualScan = 1).'
+    # --- scan source / dual scan -------------------------------------------
+    if ($Config.UsesScanSourcePolicy) {
+        # Modern builds. DisableDualScan is superseded here, so its absence is
+        # not a finding at all - only an actual conflict is.
+        $divert = @($Config.ScanSource | Where-Object { $_.Value -ne 1 })
+
+        if ($divert.Count -gt 0) {
+            $findings += New-MDFinding -Category 'Updates' -Title 'Update scan source' -Status 'Fail' `
+                -Detail ('{0} update class(es) are policy-directed to Windows Update instead of Configuration Manager' -f $divert.Count) `
+                -Evidence (@($divert | ForEach-Object { '{0} -> {1}' -f $_.What, $_.Source }) +
+                           'Configuration Manager cannot report on or deploy updates the client obtained from Windows Update, so these will scan and install outside its control.') `
+                -Remediation 'Set "Specify source service for specific classes of Windows Updates" to WSUS for every class Configuration Manager is supposed to own, or remove the policy entirely and let the client set the source itself.' `
+                -Severity 3
+        }
+        elseif ($Config.ScanSource.Count -gt 0) {
+            $findings += New-MDFinding -Category 'Updates' -Title 'Update scan source' -Status 'Pass' `
+                -Detail ('all {0} configured update class(es) point at WSUS / Configuration Manager' -f $Config.ScanSource.Count) `
+                -Evidence (@($Config.ScanSource | ForEach-Object { '{0} -> {1}' -f $_.What, $_.Source }))
+        }
+        elseif ($Config.WufbConfigured) {
+            # Deferral policies with nothing constraining the source is the one
+            # genuine dual scan risk left on a modern build.
+            $findings += New-MDFinding -Category 'Updates' -Title 'Update scan source' -Status 'Warn' `
+                -Detail 'Windows Update for Business deferral policies are configured with no scan source policy to constrain them' `
+                -Evidence (@('Configured: ' + ($Config.WufbPolicies -join ', ')) +
+                           'Deferral policies are what put a client into dual scan. With no scan source policy, this client can scan Microsoft Update directly and pick up updates Configuration Manager knows nothing about.') `
+                -Remediation 'Either remove the deferral policies (Configuration Manager handles deferral itself) or set "Specify source service for specific classes of Windows Updates" to WSUS for each class.' `
+                -Severity 2
+        }
+        else {
+            $findings += New-MDFinding -Category 'Updates' -Title 'Update scan source' -Status 'Pass' `
+                -Detail 'no deferral or scan source policy configured - the client sets its own update source' `
+                -Evidence @(('DisableDualScan does not apply on {0}; it was superseded by the scan source policy at Windows 10 1903 (build 18362).' -f $release.Name),
+                            'Without Windows Update for Business deferral policies, dual scan cannot occur.')
+        }
     }
+    else {
+        # Pre-1903, where DisableDualScan is still the control that matters -
+        # but only once deferral policies have been configured.
+        if ($Config.WufbConfigured -and $Config.DisableDualScan -ne 1) {
+            $findings += New-MDFinding -Category 'Updates' -Title 'Dual scan' -Status 'Warn' `
+                -Detail ('deferral policies are configured on {0} and DisableDualScan is not set' -f $release.Text) `
+                -Evidence (@('Configured: ' + ($Config.WufbPolicies -join ', ')) +
+                           'On this build, deferral policies without DisableDualScan send the client to Windows Update instead of the software update point, producing updates MECM knows nothing about.') `
+                -Remediation 'Set "Do not allow update deferral policies to cause scans against Windows Update" (DisableDualScan = 1), or remove the deferral policies and let Configuration Manager handle deferral.' `
+                -Severity 2
+        }
+        elseif ($Config.DisableDualScan -eq 1) {
+            $findings += New-MDFinding -Category 'Updates' -Title 'Dual scan' -Status 'Pass' `
+                -Detail 'DisableDualScan = 1, so deferral policies cannot divert the scan'
+        }
+        else {
+            $findings += New-MDFinding -Category 'Updates' -Title 'Dual scan' -Status 'Pass' `
+                -Detail 'no deferral policies configured, so dual scan cannot occur' `
+                -Evidence @('DisableDualScan only matters once Windows Update for Business deferral policies are in play. None are set here.')
+        }
+    }
+
+    $findings
+}
+
+
+function Test-MDSoftwareUpdates {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] $ClientInfo)
+
+    $findings  = @()
+    $stuckRows = @()
+
+    # --- update source, dual scan and WSUS policy conflicts -----------------
+    $findings += Test-MDUpdateSource
 
     # --- scan freshness -----------------------------------------------------
     if ($ClientInfo.Installed) {
@@ -1193,7 +1775,7 @@ function Test-MDContent {
             $findings += New-MDFinding -Category 'Content' -Title 'BITS jobs' -Status 'Warn' `
                 -Detail ('could not enumerate BITS jobs - {0}' -f $_.Exception.Message) `
                 -Remediation 'If BITS itself will not respond, restart the BITS service and re-check.' `
-                -RepairIds @($script:MDRepairIds.ServicesFix)
+                -RepairIds @($script:MDRepairIds.ServicesFix) -Data @{ Service = 'BITS' }
         }
     }
 
