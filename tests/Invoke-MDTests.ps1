@@ -23,7 +23,7 @@ $ErrorActionPreference = 'Stop'
 
 $root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 foreach ($file in @('Console.ps1', 'Common.ps1', 'ErrorCatalog.ps1', 'LogParser.ps1',
-                    'Checks.ps1', 'Repairs.ps1', 'Report.ps1', 'Bundle.ps1')) {
+                    'Checks.ps1', 'Repairs.ps1', 'Report.ps1', 'Bundle.ps1', 'Menu.ps1')) {
     . (Join-Path $root ('lib\' + $file))
 }
 
@@ -564,6 +564,307 @@ Test-Case 'every catalogue action resolves to a defined function' {
         foreach ($n in $names) {
             Assert-True ($null -ne (Get-Command -Name $n -ErrorAction SilentlyContinue)) ("{0} calls {1}, which is not defined" -f $entry.Id, $n)
         }
+    }
+}
+
+
+# ===========================================================================
+#  8. The menu
+# ===========================================================================
+Write-Host ''
+Write-Host '  Menu' -ForegroundColor White
+
+# The menu reaches the keyboard through exactly one call, Read-Host, so
+# shadowing that turns the whole thing into something a test can drive - and
+# every line of menu code above it stays the real one.
+$script:MenuAnswers   = @()
+$script:MenuExhausted = $false
+
+function Read-Host {
+    param([Parameter(Position = 0)][string] $Prompt)
+
+    if ($script:MenuAnswers.Count -eq 0) {
+        # Read-MDMenuInput treats a throwing Read-Host as a closed console, so
+        # the flag is what tells the test this was its own fault.
+        $script:MenuExhausted = $true
+        throw ('no scripted answer left for: ' + $Prompt)
+    }
+
+    $next = $script:MenuAnswers[0]
+    $script:MenuAnswers = @($script:MenuAnswers | Select-Object -Skip 1)
+    $next
+}
+
+function Invoke-MenuWith {
+    <# Answer a wizard with a scripted list of keystrokes and return what it produced. #>
+    param([string[]] $Answers, [scriptblock] $Wizard)
+
+    $script:MenuAnswers   = @($Answers)
+    $script:MenuExhausted = $false
+    $script:MDMenu.Blanks = 0
+
+    $result = & $Wizard 6>$null
+    if ($script:MenuExhausted) { throw 'the menu asked for more input than the test supplied' }
+    $result
+}
+
+Initialize-MDMenu -Defaults (New-MDRunOptions -Command 'diagnose') `
+                  -LogDirectory (Join-Path $env:TEMP 'MDTestLogs') -ScriptRoot $root -NoClear
+
+Test-Case 'the options object carries exactly the command-line parameters' {
+    $options = New-MDRunOptions -Command 'repair'
+    foreach ($key in @('Command', 'Level', 'LevelExplicit', 'Only', 'All', 'NoDiagnose', 'Verify',
+                       'Force', 'DryRun', 'Days', 'IncludeWarnings', 'SkipLogs', 'Json', 'BundlePath')) {
+        Assert-True $options.ContainsKey($key) ("New-MDRunOptions is missing {0}" -f $key)
+    }
+    Assert-Equal 'repair' $options.Command
+    Assert-Equal 7 $options.Days
+}
+
+Test-Case 'seeding the options ignores keys that are not parameters' {
+    $options = New-MDRunOptions -Command 'diagnose' -From @{ Days = 21; Nonsense = 'x' }
+    Assert-Equal 21 $options.Days
+    Assert-True (-not $options.ContainsKey('Nonsense')) 'an unknown key was copied into the options'
+}
+
+Test-Case 'every option the menu can set is read back by Invoke-MDCommand' {
+    # Catches an option the menu offers that the runner silently ignores.
+    $entry   = Get-Content -LiteralPath (Join-Path $root 'MECMDoctor.ps1') -Raw
+    $options = New-MDRunOptions -Command 'repair'
+    foreach ($key in @($options.Keys)) {
+        Assert-True ($entry -match ('\$Options\.' + [regex]::Escape($key) + '\b')) `
+                    ("Invoke-MDCommand never reads Options.{0}" -f $key)
+    }
+}
+
+Test-Case 'the equivalent command line matches the options' {
+    $options = New-MDRunOptions -Command 'repair' -From @{
+        Level = 'Safe'; LevelExplicit = $true; Verify = $true; DryRun = $true; Days = 14
+    }
+    Assert-Equal 'mecmdoctor repair -Level Safe -Verify -Days 14 -DryRun' (Get-MDCommandLine -Options $options)
+
+    $bundle = New-MDRunOptions -Command 'bundle' -From @{ BundlePath = 'C:\Two Words'; SkipLogs = $true }
+    Assert-Equal 'mecmdoctor bundle -SkipLogs -BundlePath "C:\Two Words"' (Get-MDCommandLine -Options $bundle)
+}
+
+Test-Case 'the command line leaves out flags the command does not have' {
+    # -Level and -Verify are repair-only. A diagnose line carrying them would
+    # be printed to the operator as advice that does not work.
+    $options = New-MDRunOptions -Command 'diagnose' -From @{ Level = 'Aggressive'; LevelExplicit = $true; Verify = $true; All = $true }
+    Assert-Equal 'mecmdoctor diagnose' (Get-MDCommandLine -Options $options)
+}
+
+Test-Case 'the quick path runs a command with the defaults' {
+    $result = Invoke-MenuWith -Answers @('') -Wizard { Invoke-MDDiagnoseWizard }
+    Assert-True ($result -is [hashtable]) 'the wizard did not produce an options object'
+    Assert-Equal 'mecmdoctor diagnose' (Get-MDCommandLine -Options $result)
+}
+
+Test-Case 'the option screens set what they say they set' {
+    # options first, pick the range, 14 days, include warnings, no JSON, run.
+    $result = Invoke-MenuWith -Answers @('2', '3', '14', 'y', '1', '1') -Wizard { Invoke-MDDiagnoseWizard }
+    Assert-Equal 14 $result.Days
+    Assert-True $result.IncludeWarnings 'warnings were asked for and not set'
+    Assert-True (-not $result.SkipLogs)  'log parsing was turned off by accident'
+}
+
+Test-Case 'a dry run never also asks for a verification pass' {
+    # options first, recommended tier, implicated actions, dry run, skip logs, no JSON, run.
+    $result = Invoke-MenuWith -Answers @('2', '1', '1', '2', '4', '1', '1') -Wizard { Invoke-MDRepairWizard }
+    Assert-True $result.DryRun       'the dry run was not set'
+    Assert-True (-not $result.Verify) 'a dry run has no delta to verify, but -Verify was set anyway'
+}
+
+Test-Case 'repair actions can be picked by number or by id' {
+    $second = @($script:MDRepairCatalog | Sort-Object { $_.Order })[1].Id
+
+    # options first, recommended, pick by id, "2,policy.reset", diagnose first,
+    # apply, verify, logs, no JSON, run.
+    $result = Invoke-MenuWith -Answers @('2', '1', '3', ('2,policy.reset'), 'y', '1', 'n', '1', '1', '1') `
+                              -Wizard { Invoke-MDRepairWizard }
+    Assert-Equal 2 @($result.Only).Count
+    Assert-True (@($result.Only) -contains $second)       'the numbered action was not selected'
+    Assert-True (@($result.Only) -contains 'policy.reset') 'the named action was not selected'
+    Assert-True (-not $result.NoDiagnose) 'the diagnosis was skipped when it was asked for'
+}
+
+Test-Case 'an action id that is not in the catalogue is rejected, not accepted' {
+    $result = Invoke-MenuWith -Answers @('2', '1', '3', 'not.a.repair', '1', 'y', '1', 'n', '1', '1', '1') `
+                              -Wizard { Invoke-MDRepairWizard }
+    Assert-True (@($result.Only) -notcontains 'not.a.repair') 'an unknown repair id was accepted'
+    Assert-Equal 1 @($result.Only).Count
+}
+
+Test-Case 'back from the first screen returns to the start, not out of the menu' {
+    # options first, back, then run: a wizard must not drop the operator out
+    # of the command they chose just because they changed their mind once.
+    $result = Invoke-MenuWith -Answers @('2', 'b', '1') -Wizard { Invoke-MDBundleWizard }
+    Assert-True ($result -is [hashtable]) 'backing out of step one abandoned the command'
+    Assert-Equal 'mecmdoctor bundle' (Get-MDCommandLine -Options $result)
+}
+
+Test-Case 'quit is honoured from inside a wizard' {
+    $result = Invoke-MenuWith -Answers @('q') -Wizard { Invoke-MDLogsWizard }
+    Assert-Equal $script:MDMenuQuit $result
+}
+
+Test-Case 'the logs command is never offered the option of skipping the logs' {
+    $options = New-MDRunOptions -Command 'logs'
+    $result  = Invoke-MenuWith -Answers @('4', '1', '1', '1') -Wizard {
+        Step-MDLogScope -Options $options -Position 'test' -NoSkip
+    }
+    Assert-True (-not $options.SkipLogs) 'the logs command accepted -SkipLogs, which would leave it nothing to do'
+}
+
+Test-Case 'a menu with nobody answering it closes instead of looping forever' {
+    # A closed stdin returns empty strings for ever. Five of them that no
+    # prompt could use as a default is the end of the session.
+    $result = Invoke-MenuWith -Answers @('', '', '', '', '', '', '', '') -Wizard {
+        Read-MDMenuChoice -Options @( @{ Key = '1'; Label = 'One' } ) -NoBack
+    }
+    Assert-Equal $script:MDMenuQuit $result
+}
+
+Test-Case 'repair and reinstall are refused before the questions, not after' {
+    if (Test-MDAdmin) {
+        # Elevated, so the gate does not apply: check it would apply at all.
+        Assert-True ($null -ne (Get-Command Show-MDElevationRequired -ErrorAction SilentlyContinue)) `
+                    'there is no elevation gate in front of repair'
+    }
+    else {
+        $result = Invoke-MenuWith -Answers @('2') -Wizard { Get-MDMenuRunRequest -Command 'repair' }
+        Assert-Equal 'diagnose' $result
+    }
+}
+
+Test-Case 'the launcher accepts every command the entry script does' {
+    # mecmdoctor.bat keeps its own whitelist so a typo does not raise a UAC
+    # prompt. The two lists drifting apart is how "menu" stops working.
+    $entry = Get-Content -LiteralPath (Join-Path $root 'MECMDoctor.ps1') -Raw
+    $bat   = Get-Content -LiteralPath (Join-Path $root 'mecmdoctor.bat') -Raw
+
+    Assert-True ($entry -match "ValidateSet\(([^)]*)\)\]\s*\r?\n\s*\[string\]\s+\`$Command") 'could not find the Command ValidateSet'
+    $commands = [regex]::Matches($Matches[1], "'([a-z]+)'") | ForEach-Object { $_.Groups[1].Value }
+    Assert-True ($commands -contains 'menu') 'menu is not a valid command'
+
+    foreach ($name in $commands) {
+        if ($name -in @('help', 'version')) { continue }   # handled earlier, before elevation
+        Assert-True ($bat -match ('"!FIRSTARG!"=="' + $name + '"')) ("mecmdoctor.bat rejects the {0} command" -f $name)
+    }
+}
+
+
+# ===========================================================================
+#  9. -Quiet
+# ===========================================================================
+Write-Host ''
+Write-Host '  Quiet output' -ForegroundColor White
+
+function Get-MDConsoleText {
+    <# What a block of output actually put on the screen, as one string. #>
+    param([scriptblock] $Body)
+    $records = & $Body 6>&1
+    (@($records | ForEach-Object { "$_" }) -join "`n")
+}
+
+function New-QuietFinding {
+    param([string] $Status, [string] $Title)
+    New-MDFinding -Category 'Test' -Title $Title -Status $Status -Detail 'the detail' `
+                  -Evidence @('the supporting evidence') -Remediation 'the remediation'
+}
+
+Test-Case '-Quiet takes a passing check off the screen, evidence and all' {
+    $finding = New-QuietFinding -Status 'Pass' -Title 'a passing check'
+
+    Initialize-MDConsole -NoColor -Tag 'tests'
+    $loud = Get-MDConsoleText { $finding | Write-MDFinding }
+
+    Initialize-MDConsole -NoColor -Quiet -Tag 'tests'
+    $quiet = Get-MDConsoleText { $finding | Write-MDFinding }
+
+    Assert-True ($loud  -match 'a passing check')        'the check was not printed without -Quiet'
+    Assert-True ($quiet -notmatch 'a passing check')     '-Quiet still printed a check that passed'
+
+    # The important half: hiding a headline and keeping its evidence would
+    # leave dangling fragments with nothing to belong to.
+    Assert-True ($loud  -match 'supporting evidence')    'the evidence was not printed without -Quiet'
+    Assert-True ($quiet -notmatch 'supporting evidence') '-Quiet orphaned the evidence of a check it had hidden'
+
+    Initialize-MDConsole -NoColor -Tag 'tests'
+}
+
+Test-Case '-Quiet never hides a failure, its evidence or its fix' {
+    Initialize-MDConsole -NoColor -Quiet -Tag 'tests'
+    $text = Get-MDConsoleText { (New-QuietFinding -Status 'Fail' -Title 'a failing check') | Write-MDFinding }
+    Initialize-MDConsole -NoColor -Tag 'tests'
+
+    Assert-True ($text -match 'a failing check')       '-Quiet hid a failure'
+    Assert-True ($text -match 'supporting evidence')   '-Quiet hid the evidence behind a failure'
+    Assert-True ($text -match 'the remediation')       '-Quiet hid the fix for a failure'
+}
+
+Test-Case '-Quiet never hides a warning' {
+    Initialize-MDConsole -NoColor -Quiet -Tag 'tests'
+    $text = Get-MDConsoleText { (New-QuietFinding -Status 'Warn' -Title 'a warning check') | Write-MDFinding }
+    Initialize-MDConsole -NoColor -Tag 'tests'
+
+    Assert-True ($text -match 'a warning check') '-Quiet hid a warning'
+}
+
+Test-Case '-Quiet never hides a question' {
+    # A repair gate nobody can see is the worst possible outcome of a flag
+    # whose entire job is to print less.
+    Initialize-MDConsole -NoColor -Quiet -Tag 'tests'
+    $text = Get-MDConsoleText { [void](Read-MDConfirm -Question 'do the destructive thing?' -Force) }
+    Initialize-MDConsole -NoColor -Tag 'tests'
+
+    Assert-True ($text -match 'do the destructive thing') '-Quiet hid a confirmation prompt'
+}
+
+Test-Case '-Quiet changes nothing in the transcripts' {
+    $dir = Join-Path $env:TEMP ('MDQuietTest_' + [Guid]::NewGuid().ToString('N'))
+    try {
+        $write = {
+            $findings = @(
+                New-QuietFinding -Status 'Pass' -Title 'a passing check'
+                New-QuietFinding -Status 'Fail' -Title 'a failing check'
+            )
+            Set-MDStepTotal 1
+            Write-MDStep 'a step heading'
+            $findings | Write-MDFinding
+            Write-MDAction 'a progress line'
+        }
+
+        Initialize-MDConsole -LogDirectory $dir -NoColor -Tag 'loud'
+        $loudPath = $script:MDLog.PlainPath
+        & $write 6>$null
+
+        Initialize-MDConsole -LogDirectory $dir -NoColor -Quiet -Tag 'quiet'
+        $quietPath = $script:MDLog.PlainPath
+        & $write 6>$null
+
+        # Drop the header line and the "HH:mm:ss  " stamp each line carries.
+        $body = {
+            param($path)
+            (@(Get-Content -LiteralPath $path | Select-Object -Skip 1 |
+                ForEach-Object { $_.Substring([Math]::Min(10, $_.Length)) }) -join "`n")
+        }
+
+        Assert-True ((& $body $loudPath).Length -gt 0) 'the loud transcript is empty'
+        Assert-Equal (& $body $loudPath) (& $body $quietPath) 'the transcripts are not identical'
+    }
+    finally {
+        Initialize-MDConsole -NoColor -Tag 'tests'
+        Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+Test-Case 'every -Quiet suppression happens through the one switch' {
+    # Suppression is only ever "chatter plus quiet". Anything that tested
+    # MDLog.Quiet on its own would be a second, undocumented rule.
+    foreach ($file in @('Common.ps1', 'Checks.ps1', 'Repairs.ps1', 'Report.ps1', 'LogParser.ps1', 'Bundle.ps1', 'Menu.ps1')) {
+        $source = Get-Content -LiteralPath (Join-Path $root ('lib\' + $file)) -Raw
+        Assert-True ($source -notmatch '\$script:MDLog\.Quiet') ("{0} decides for itself what -Quiet means" -f $file)
     }
 }
 

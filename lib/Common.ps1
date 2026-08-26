@@ -118,18 +118,23 @@ function Write-MDFinding {
         $headline  = $Finding.Title
         if ($Finding.Detail) { $headline = $Finding.Title + ' -- ' + $Finding.Detail }
 
+        # A check that passed is the running commentary; a check that did not
+        # is the reason the tool was run. -Quiet keeps the second and drops the
+        # first from the screen. Both are always written to the transcripts.
+        $chatter = ($Finding.Status -notin @('Warn', 'Fail'))
+
         switch ($Finding.Status) {
-            'Pass' { Write-MDOk   $headline -Component $component }
+            'Pass' { Write-MDOk   $headline -Component $component -Chatter }
             'Warn' { Write-MDWarn $headline -Component $component }
             'Fail' { Write-MDFail $headline -Component $component }
-            'Skip' { Write-MDSkip $headline -Component $component }
-            default { Write-MDInfo $headline -Component $component }
+            'Skip' { Write-MDSkip $headline -Component $component -Chatter }
+            default { Write-MDInfo $headline -Component $component -Chatter }
         }
 
         if (-not $HideEvidence -and $Finding.Evidence -and $Finding.Evidence.Count) {
             foreach ($line in $Finding.Evidence) {
                 if ([string]::IsNullOrWhiteSpace($line)) { continue }
-                Write-MDDetail -Text $line -Bullet '- '
+                Write-MDDetail -Text $line -Bullet '- ' -Chatter:$chatter
             }
         }
 

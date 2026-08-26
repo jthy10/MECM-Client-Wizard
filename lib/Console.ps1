@@ -72,10 +72,59 @@ $script:MDColors = @{
 }
 
 
+function Test-MDInteractive {
+<#
+    .SYNOPSIS
+        True when there is a real console for a prompt to appear on.
+    .DESCRIPTION
+        A scheduled task, an MECM script deployment, a remoting session or
+        redirected output all have nowhere to draw a question, and a Read-Host
+        there either returns nothing forever or blocks. Everything that wants
+        to ask the operator something checks this first.
+#>
+    try {
+        if ($null -eq $Host.UI.RawUI.WindowSize) { return $false }
+    }
+    catch {
+        return $false
+    }
+    $true
+}
+
+
+function Test-MDMenuCapable {
+<#
+    .SYNOPSIS
+        True when there is a person at a keyboard for a menu to talk to.
+    .DESCRIPTION
+        Stricter than Test-MDInteractive, and used only to decide whether to
+        draw the menu at all.
+
+        A scheduled task, an MECM script deployment and a piped-in answer file
+        can all end up with a console window of some sort attached, so a window
+        size on its own does not prove that anybody is there to type. Redirected
+        input does prove that nobody is - and a menu nobody can answer is worse
+        than no menu, because it does nothing at all.
+
+        Read-MDConfirm deliberately does not use this: an operator who pipes an
+        answer into a repair still gets their answer honoured.
+#>
+    if (-not (Test-MDInteractive)) { return $false }
+    try {
+        if ([Console]::IsInputRedirected) { return $false }
+    }
+    catch { }
+    $true
+}
+
+
 function Initialize-MDConsole {
 <#
     .SYNOPSIS
         Configures the logging engine and opens the on-disk transcripts.
+    .DESCRIPTION
+        Safe to call more than once: the menu re-runs it for every command so
+        that each one gets its own pair of transcripts, named for it.
     .PARAMETER LogDirectory
         Where the two transcript files are written. Created if missing.
     .PARAMETER NoColor
@@ -97,6 +146,16 @@ function Initialize-MDConsole {
     $script:MDLog.Started = Get-Date
     $script:MDLog.Quiet   = [bool]$Quiet
     $script:MDLog.Debug   = [bool]$DebugOutput
+
+    # Forget the previous run's transcripts before deciding on this one's.
+    # Without this, re-initialising without a log directory would leave the
+    # engine still appending to a file the last run has already closed off.
+    $script:MDLog.PlainPath   = $null
+    $script:MDLog.CMTracePath = $null
+    $script:MDLog.StepIndex   = 0
+    $script:MDLog.StepTotal   = 0
+    $script:MDLog.Failures    = 0
+    $script:MDLog.Warnings    = 0
 
     # Colour is opt-out, but we also drop it automatically when the host has no
     # real screen buffer (scheduled task, remote exec, redirected output).
@@ -298,8 +357,12 @@ function Write-MDStep {
     $head = $prefix + ' ' + $Title.ToUpperInvariant() + ' '
     $pad  = [Math]::Max($script:MDLog.Width - $head.Length, 3)
 
-    Write-MDLine ''
-    Write-MDLine ($head + ('-' * $pad)) -Color $script:MDColors.Step
+    # A step heading is a divider for the commentary underneath it. With -Quiet
+    # there is no commentary underneath it, so the heading goes too.
+    $hide = [bool]$script:MDLog.Quiet
+
+    Write-MDLine '' -NoConsole:$hide
+    Write-MDLine ($head + ('-' * $pad)) -Color $script:MDColors.Step -NoConsole:$hide
 }
 
 
@@ -307,20 +370,30 @@ function Write-MDStep {
 # Status lines. Every one has the same shape:   "  [TAG] message"
 # ---------------------------------------------------------------------------
 function Write-MDStatus {
+<#
+    .PARAMETER Chatter
+        Marks a line as running commentary rather than a result: progress,
+        a check that passed, a file that was written. -Quiet drops those from
+        the screen and keeps them in the transcripts, which is the whole of
+        what -Quiet means. Warnings, failures, questions, the summary and the
+        footer are never chatter.
+#>
     param(
         [Parameter(Mandatory)][string] $Tag,
         [Parameter(Mandatory)][AllowEmptyString()][string] $Message,
         [string] $Color,
         [int]    $Severity  = 1,
         [string] $Component = 'mecmdoctor',
-        [int]    $Indent    = 2
+        [int]    $Indent    = 2,
+        [switch] $Chatter
     )
-    Write-MDLine ((' ' * $Indent) + $Tag + ' ' + $Message) -Color $Color -Severity $Severity -Component $Component
+    $hide = ($Chatter -and $script:MDLog.Quiet)
+    Write-MDLine ((' ' * $Indent) + $Tag + ' ' + $Message) -Color $Color -Severity $Severity -Component $Component -NoConsole:$hide
 }
 
 function Write-MDOk {
-    param([string] $Message, [string] $Component = 'mecmdoctor', [int] $Indent = 2)
-    Write-MDStatus -Tag $script:MDTags.Ok -Message $Message -Color $script:MDColors.Ok -Severity 1 -Component $Component -Indent $Indent
+    param([string] $Message, [string] $Component = 'mecmdoctor', [int] $Indent = 2, [switch] $Chatter)
+    Write-MDStatus -Tag $script:MDTags.Ok -Message $Message -Color $script:MDColors.Ok -Severity 1 -Component $Component -Indent $Indent -Chatter:$Chatter
 }
 
 function Write-MDWarn {
@@ -336,18 +409,19 @@ function Write-MDFail {
 }
 
 function Write-MDInfo {
-    param([string] $Message, [string] $Component = 'mecmdoctor', [int] $Indent = 2)
-    Write-MDStatus -Tag $script:MDTags.Info -Message $Message -Color $script:MDColors.Info -Severity 1 -Component $Component -Indent $Indent
+    param([string] $Message, [string] $Component = 'mecmdoctor', [int] $Indent = 2, [switch] $Chatter)
+    Write-MDStatus -Tag $script:MDTags.Info -Message $Message -Color $script:MDColors.Info -Severity 1 -Component $Component -Indent $Indent -Chatter:$Chatter
 }
 
 function Write-MDSkip {
-    param([string] $Message, [string] $Component = 'mecmdoctor', [int] $Indent = 2)
-    Write-MDStatus -Tag $script:MDTags.Skip -Message $Message -Color $script:MDColors.Skip -Severity 1 -Component $Component -Indent $Indent
+    param([string] $Message, [string] $Component = 'mecmdoctor', [int] $Indent = 2, [switch] $Chatter)
+    Write-MDStatus -Tag $script:MDTags.Skip -Message $Message -Color $script:MDColors.Skip -Severity 1 -Component $Component -Indent $Indent -Chatter:$Chatter
 }
 
 function Write-MDAction {
+    <# "About to do a thing." Always chatter: it is progress, never a result. #>
     param([string] $Message, [string] $Component = 'mecmdoctor', [int] $Indent = 2)
-    Write-MDStatus -Tag $script:MDTags.Action -Message $Message -Color $script:MDColors.Action -Severity 1 -Component $Component -Indent $Indent
+    Write-MDStatus -Tag $script:MDTags.Action -Message $Message -Color $script:MDColors.Action -Severity 1 -Component $Component -Indent $Indent -Chatter
 }
 
 function Write-MDDebug {
@@ -370,14 +444,21 @@ function Write-MDDetail {
     .DESCRIPTION
         Word-wraps to the render width and keeps a hanging indent, so a long
         remediation sentence still reads as one visual block.
+    .PARAMETER Chatter
+        See Write-MDStatus. Set it when this detail belongs to a line that is
+        itself chatter, so that -Quiet never leaves the evidence on screen
+        with the statement it was supporting removed.
 #>
     param(
         [Parameter(ValueFromPipeline)][AllowEmptyString()][string[]] $Text,
         [int]    $Indent = 9,
         [string] $Color  = 'DarkGray',
-        [string] $Bullet = ''
+        [string] $Bullet = '',
+        [switch] $Chatter
     )
     process {
+        $hide = ($Chatter -and $script:MDLog.Quiet)
+
         foreach ($line in @($Text)) {
             if ($null -eq $line) { continue }
 
@@ -389,17 +470,17 @@ function Write-MDDetail {
             # and a raw tab wrecks the indentation of everything after it.
             foreach ($raw in ($line -split "`r?`n")) {
                 $work = ($raw -replace "`t", '  ').TrimEnd()
-                if ($work.Length -eq 0) { Write-MDLine '' -Color $Color; continue }
+                if ($work.Length -eq 0) { Write-MDLine '' -Color $Color -NoConsole:$hide; continue }
 
                 while ($work.Length -gt $avail) {
                     $cut = $work.LastIndexOf(' ', [Math]::Min($avail, $work.Length - 1))
                     if ($cut -lt 20) { $cut = $avail }
-                    Write-MDLine ($prefix + $work.Substring(0, $cut)) -Color $Color
+                    Write-MDLine ($prefix + $work.Substring(0, $cut)) -Color $Color -NoConsole:$hide
                     $work   = $work.Substring($cut).TrimStart()
                     $prefix = ' ' * ($Indent + $Bullet.Length)   # hanging indent
                 }
 
-                Write-MDLine ($prefix + $work) -Color $Color
+                Write-MDLine ($prefix + $work) -Color $Color -NoConsole:$hide
                 $prefix = (' ' * $Indent) + $Bullet
             }
         }
@@ -495,14 +576,7 @@ function Read-MDConfirm {
 
     # No interactive host (scheduled task, MECM script deployment, remoting):
     # decline rather than block forever waiting on a Read-Host nobody sees.
-    $interactive = $true
-    try {
-        if ($null -eq $Host.UI.RawUI.WindowSize) { $interactive = $false }
-    } catch {
-        $interactive = $false
-    }
-
-    if (-not $interactive) {
+    if (-not (Test-MDInteractive)) {
         Write-MDStatus -Tag $script:MDTags.Ask -Severity 2 -Color $script:MDColors.Ask `
             -Message ($Question + '  ->  declined (non-interactive session; re-run with -Force)')
         return $false

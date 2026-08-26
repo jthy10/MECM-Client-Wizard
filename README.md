@@ -6,7 +6,10 @@ A dedicated, open-source troubleshooting utility for Microsoft Endpoint Configur
 It finds out **why** a client is unhealthy, explains the failure in plain English, tells you which
 repairs it wants to run and why — and then asks before it runs any of them.
 
+Run it with no arguments and you get a menu. Run it with a command and it goes straight there.
+
 ```
+mecmdoctor              the menu
 mecmdoctor diagnose
 mecmdoctor repair
 mecmdoctor bundle
@@ -40,8 +43,11 @@ sequences applies. This tool does that part for you:
 ```
 git clone https://github.com/jthy10/MECM-Client-Wizard.git
 cd MECM-Client-Wizard
-mecmdoctor diagnose
+mecmdoctor
 ```
+
+That opens the menu. Double-clicking `mecmdoctor.bat` in Explorer does the same thing, so there is a
+path through this tool that needs no command line at all.
 
 `mecmdoctor.bat` handles execution policy and requests elevation for you. If you would rather call
 PowerShell directly:
@@ -59,13 +65,74 @@ No modules to install. Administrator rights are required for repairs and for sev
 
 | Command | What it does |
 |---|---|
-| `mecmdoctor diagnose` | Read-only health check across thirteen areas, plus log analysis. Changes nothing. This is the default. |
+| `mecmdoctor` | The menu. This is what you get when you name no command. |
+| `mecmdoctor diagnose` | Read-only health check across thirteen areas, plus log analysis. Changes nothing. |
 | `mecmdoctor repair` | Diagnose, explain what is recommended and why, ask, then apply exactly the repairs the diagnosis implicated. |
 | `mecmdoctor logs` | Parse `C:\Windows\CCM\Logs` and translate every error found. |
 | `mecmdoctor bundle` | Diagnose, then build a timestamped support ZIP for someone else to read. |
 | `mecmdoctor reinstall` | Remove and reinstall the client, using your `ClientReinstall.ps1` when you supply one. |
 | `mecmdoctor help` | Full usage, including every repair action id. |
 | `mecmdoctor version` | Print the version. |
+
+---
+
+## The menu
+
+Typing `mecmdoctor` with no command opens a menu, so nobody has to know the flags to get a result:
+
+```
+=========================================================================
+   M E C M   C L I E N T   W I Z A R D
+   mecmdoctor v1.2.0  --  main menu
+=========================================================================
+
+  Computer         : WKS-4471   (CONTOSO)
+  Windows          : Microsoft Windows 11 Enterprise (10.0.26100)   23H2
+  Client           : installed   5.00.9128.1008
+  Site / MP        : AB1   /   mp01.contoso.com
+  Running as       : CONTOSO\jsmith   (elevated)
+
+  WHAT DO YOU WANT TO DO?
+
+    1   Diagnose        Read-only health check. Changes nothing.
+    2   Repair          Diagnose, explain, ask, then fix what is broken.
+    3   Bundle          Build a support ZIP for someone else to read.
+    4   Logs            Read the CCM logs and translate every error.
+    5   Reinstall       Remove and reinstall the client. Last resort.
+    6   Help            Full usage, every option and every repair id.
+    7   Log folder      Open the folder the transcripts are written to.
+    Q   Quit
+
+   Select:
+```
+
+Pick a command and you get its options as questions rather than flags — the repair tier and what it
+costs, which actions may run, dry run or for real, how far back to read the logs, where the ZIP
+goes. Or take the first answer on every screen and it runs with the defaults.
+
+- **Nothing is a dead end.** Every prompt takes `Enter` for the default, `B` to go back one screen
+  and `Q` to leave.
+- **The first answer is always "just run it".** Each command opens on *Run it now* / *Options
+  first*, so a run is three keystrokes away and the questions are opt-in.
+- **It shows its working.** Before a run and again on the review screen, the menu prints the command
+  line that would have produced it — `mecmdoctor repair -Level Safe -Verify` — so the menu is also
+  how you learn to stop needing it.
+- **It hands you the next thing.** When a diagnosis finds problems the finish screen offers the
+  repair it recommends; after a repair it offers to re-check; when anything came back unhealthy it
+  offers to bundle it up for whoever looks at it next.
+- **It stops you wasting your time.** Choosing repair or reinstall without administrative rights
+  says so immediately and offers to re-launch elevated, rather than asking four screens of questions
+  and then refusing.
+- **It changes nothing about the safety model.** The menu only decides what to run. `repair` still
+  prints its plan and the finding behind each action, still asks before it touches anything, and
+  still asks again for each destructive action.
+
+Every command run from the menu writes its own pair of transcripts, named for it, exactly as though
+it had been typed at a prompt. Menu navigation itself is not logged.
+
+A session with no console — a scheduled task, an MECM script deployment, a remote shell, or output
+piped to a file — has nobody to answer a menu, so `mecmdoctor` with no command runs a diagnosis
+there instead of waiting at a prompt.
 
 ---
 
@@ -375,6 +442,13 @@ Console output uses fixed-width ASCII status tags (`[ OK ]`, `[WARN]`, `[FAIL]`,
 `[ >> ]`, `[ ?? ]`) rather than Unicode glyphs, because legacy console code pages are still common on
 exactly the kind of endpoint this tool gets pointed at. Add `-NoColor` when piping to a file.
 
+`-Quiet` trims the screen down to the parts you would have scrolled to anyway. A line is dropped only
+if it is *running commentary* — a check that passed and its evidence, a step heading, a progress
+line, the per-file notes a bundle emits as it builds. Warnings, failures and everything they say,
+the summary table, the issues list with its fixes, repair results, confirmation prompts and the
+footer all stay exactly where they were. **The two transcripts are written in full either way**, so
+`-Quiet` never costs you anything you might need afterwards.
+
 For fleet collection, `-Json <path>` writes a flat, stable report:
 
 ```powershell
@@ -415,8 +489,9 @@ past its confirmation gate without `-Force`.
 | `-BundlePath <path>` | Where `bundle` writes its ZIP: a folder, or a full path ending in `.zip`. |
 | `-LogDirectory <path>` | Where transcripts go. |
 | `-NoColor` | Plain output, for piping to a file. |
-| `-Quiet` | Less console chatter; the transcripts stay complete. |
+| `-Quiet` | Drop the running commentary from the screen — passing checks, step headings, progress lines. Warnings, failures, the summary and both transcripts are untouched. |
 | `-Trace` | Show the low-level diagnostic lines on screen. |
+| `-NoClear` | Menu only: never clear the screen, so the whole session stays in the scrollback. |
 
 ---
 
@@ -434,6 +509,7 @@ lib/
   Repairs.ps1               all repair actions - the only code that writes
   Report.ps1                summary rendering, repair rationale, JSON export
   Bundle.ps1                the support bundle
+  Menu.ps1                  the interactive menu and its option wizards
 tests/
   Invoke-MDTests.ps1        the test run - no Pester, no modules, read-only
 ClientReinstall.example.ps1 template for your own reinstall script
@@ -441,6 +517,10 @@ ClientReinstall.example.ps1 template for your own reinstall script
 
 Checks never modify the machine; repairs are confined to `Repairs.ps1`. That split is the main
 design rule, and it is what makes `diagnose` safe to run anywhere without thinking about it.
+
+`Menu.ps1` does no work of its own either. Every screen ends by producing the same options object
+the command line parses into, which the entry script hands to one runner — so a menu-driven run and
+a typed one are the same run, and there is no second place a command's behaviour can drift.
 
 ---
 
@@ -461,6 +541,12 @@ client identity, that a large WMI repository never plans a reset, that `-All` ca
 without a correlated failure produces no repair, that a modern build is not failed for a missing
 `DisableDualScan` while a pre-1903 build still is, and that the bundle produces a readable ZIP with a
 valid JSON report inside.
+
+The menu is tested the same way an operator uses it: the tests shadow `Read-Host` with a scripted
+list of keystrokes and drive the real screens, checking that each answer sets the option it claims
+to, that a dry run never also asks for a verification pass, that an unknown repair id is rejected
+rather than passed through, that going back from the first screen returns to the start instead of
+abandoning the command, and that a menu nobody is answering closes instead of looping forever.
 
 ---
 

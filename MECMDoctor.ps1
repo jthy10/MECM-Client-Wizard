@@ -6,6 +6,8 @@
      An open-source troubleshooting utility for Microsoft Endpoint Configuration
      Manager (MECM / SCCM / ConfigMgr) clients.
 
+       mecmdoctor               the menu: pick a command, answer a few
+                                questions, watch it run, pick the next thing
        mecmdoctor diagnose      read-only health check of the whole client
        mecmdoctor repair        diagnose, explain, confirm, then repair
        mecmdoctor logs          parse C:\Windows\CCM\Logs and translate errors
@@ -30,6 +32,7 @@
        lib\Repairs.ps1       all repair actions (the only code that writes)
        lib\Report.ps1        summary rendering and JSON export
        lib\Bundle.ps1        the support bundle
+       lib\Menu.ps1          the interactive menu and its option wizards
 
      ClientReinstall.ps1     OPTIONAL. Drop your own reinstall script beside
                              this file and mecmdoctor uses it instead of its
@@ -66,9 +69,11 @@ param(
     # ---- what to do --------------------------------------------------------
 
     # The command to run. Positional so "MECMDoctor.ps1 diagnose" just works.
+    # Left off entirely you get the menu - unless there is no console to draw
+    # it on, in which case a diagnosis is run instead.
     [Parameter(Position = 0)]
-    [ValidateSet('diagnose', 'repair', 'logs', 'bundle', 'reinstall', 'help', 'version')]
-    [string] $Command = 'diagnose',
+    [ValidateSet('menu', 'diagnose', 'repair', 'logs', 'bundle', 'reinstall', 'help', 'version')]
+    [string] $Command = 'menu',
 
     # Repair tier. Safe = reversible; Standard = rebuilds regenerable state;
     # Aggressive = destructive, always confirmed unless -Force.
@@ -127,17 +132,25 @@ param(
     [string] $BundlePath,
 
     [switch] $NoColor,
+
+    # Trim the running commentary from the screen: checks that passed, step
+    # headings, progress lines. Warnings, failures, the summary and both
+    # transcripts are untouched.
     [switch] $Quiet,
 
     # Show the low-level [ .. ] diagnostic lines on screen.
     [Alias('DebugOutput')]
-    [switch] $Trace
+    [switch] $Trace,
+
+    # Menu only: never clear the screen, so the whole session stays in the
+    # scrollback where it can be read back or copied out.
+    [switch] $NoClear
 )
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'   # Invoke-WebRequest is much faster without it
 
-$script:MDVersion = '1.1.0'
+$script:MDVersion = '1.2.0'
 
 # Whether the operator actually chose a tier. Left alone, `repair` follows the
 # tier the diagnosis recommends rather than a hard-coded default.
@@ -160,6 +173,7 @@ $libFiles = @(
     'Repairs.ps1'
     'Report.ps1'
     'Bundle.ps1'
+    'Menu.ps1'
 )
 
 foreach ($file in $libFiles) {
@@ -188,15 +202,22 @@ function Show-MDHelp {
 
     Write-MDSection 'Usage'
     Write-MDLine ''
-    Write-MDLine '  mecmdoctor <command> [options]' -Color 'Cyan'
+    Write-MDLine '  mecmdoctor                      the menu' -Color 'Cyan'
+    Write-MDLine '  mecmdoctor <command> [options]  straight to one command' -Color 'Cyan'
     Write-MDLine ''
     Write-MDLine '  Or directly:' -Color 'Gray'
     Write-MDLine '  powershell -ExecutionPolicy Bypass -File .\MECMDoctor.ps1 <command> [options]' -Color 'Gray'
+    Write-MDLine ''
+    Write-MDDetail -Indent 2 -Text @(
+        'With no command at all you get a menu: pick what to do, answer a few questions about how, watch it run, then pick the next thing. Every menu run prints the command line that would have produced it, so the menu is also how you learn the flags below.'
+        'A session with no console - a scheduled task, an MECM script deployment, a remote shell - has nobody to answer a menu, so it runs a diagnosis instead of waiting at a prompt.'
+    )
 
     Write-MDSection 'Commands'
     Write-MDLine ''
     $commands = @(
-        [pscustomobject]@{ Name = 'diagnose';  What = 'Read-only health check. Changes nothing. This is the default.' }
+        [pscustomobject]@{ Name = 'menu';      What = 'The interactive menu. This is what you get when you name no command.' }
+        [pscustomobject]@{ Name = 'diagnose';  What = 'Read-only health check. Changes nothing.' }
         [pscustomobject]@{ Name = 'repair';    What = 'Diagnose, explain what is recommended and why, ask, then repair.' }
         [pscustomobject]@{ Name = 'logs';      What = 'Parse the CCM logs and translate every error found.' }
         [pscustomobject]@{ Name = 'bundle';    What = 'Diagnose, then build a timestamped support ZIP for someone else to read.' }
@@ -252,8 +273,9 @@ function Show-MDHelp {
         [pscustomobject]@{ Flag = '-BundlePath';     What = 'Where bundle writes its ZIP: a folder, or a full path ending in .zip.' }
         [pscustomobject]@{ Flag = '-LogDirectory';   What = 'Where transcripts go. Default: %ProgramData%\MECMDoctor\Logs.' }
         [pscustomobject]@{ Flag = '-NoColor';        What = 'Plain output, for piping to a file.' }
-        [pscustomobject]@{ Flag = '-Quiet';          What = 'Less console chatter. The transcripts stay complete.' }
+        [pscustomobject]@{ Flag = '-Quiet';          What = 'Drop passing checks, step headings and progress lines from the screen. Warnings, failures, the summary and both transcripts are untouched.' }
         [pscustomobject]@{ Flag = '-Trace';          What = 'Show the low-level diagnostic lines on screen.' }
+        [pscustomobject]@{ Flag = '-NoClear';        What = 'Menu only: never clear the screen, so the whole session stays in the scrollback.' }
     )
     Write-MDTable -Rows $options -Indent 2 -Columns @(
         @{ Header = 'OPTION'; Property = 'Flag'; Width = 18 }
@@ -278,6 +300,7 @@ function Show-MDHelp {
     Write-MDSection 'Examples'
     Write-MDLine ''
     $examples = @(
+        'mecmdoctor                                        # the menu'
         'mecmdoctor diagnose'
         'mecmdoctor diagnose -SkipLogs -Json C:\Temp\client.json'
         'mecmdoctor logs -Days 14 -IncludeWarnings'
@@ -402,13 +425,513 @@ function Invoke-MDDiagnose {
 
 
 # ---------------------------------------------------------------------------
+# One run
+# ---------------------------------------------------------------------------
+function Invoke-MDCommand {
+<#
+    .SYNOPSIS
+        Runs one command with one set of options.
+    .DESCRIPTION
+        The command line and the menu both end up here, so there is exactly
+        one implementation of what each command means.
+
+        The result is recorded in $script:MDLastRun rather than returned: a
+        stray line of pipeline output from anywhere in the library would
+        otherwise be indistinguishable from an exit code.
+    .PARAMETER Options
+        The options hashtable built by New-MDRunOptions - one key per
+        command-line parameter.
+    .PARAMETER ClientInfo
+        Client discovery results, when the caller already has fresh ones.
+        Discovered here when it does not.
+#>
+    param(
+        [Parameter(Mandatory)][hashtable] $Options,
+        $ClientInfo,
+        $HostFacts
+    )
+
+    # Unpacked into locals so that the body below reads exactly like the
+    # parameter block it used to read from.
+    $Command         = $Options.Command
+    $Level           = $Options.Level
+    $levelExplicit   = [bool]$Options.LevelExplicit
+    $Only            = @($Options.Only)
+    $All             = [bool]$Options.All
+    $NoDiagnose      = [bool]$Options.NoDiagnose
+    $Verify          = [bool]$Options.Verify
+    $Force           = [bool]$Options.Force
+    $DryRun          = [bool]$Options.DryRun
+    $Days            = [int]$Options.Days
+    $IncludeWarnings = [bool]$Options.IncludeWarnings
+    $SkipLogs        = [bool]$Options.SkipLogs
+    $Json            = $Options.Json
+    $BundlePath      = $Options.BundlePath
+
+    $exitCode      = 0
+    $blocked       = $false
+    $findings      = @()
+    $repairResults = @()
+    $summary       = $null
+    $repairSummary = $null
+    $bundleZip     = $null
+
+    try {
+        $facts = $HostFacts
+        if (-not $facts) { $facts = Get-MDHostFacts }
+
+        Write-MDBanner -Version $script:MDVersion -Command $Command -Facts $facts
+
+        if (-not (Test-MDAdmin)) {
+            Write-MDWarn 'Not running elevated. Many checks will return incomplete results and no repair can be applied.'
+            Write-MDDetail -Text 'Re-run using mecmdoctor.bat, which requests elevation automatically.' -Bullet '> ' -Color 'DarkYellow'
+
+            # Read-only commands can still produce something useful; repairs cannot.
+            if ($Command -in @('repair', 'reinstall')) {
+                Write-MDFail 'Refusing to attempt repairs without administrative rights.'
+                $exitCode = 4
+                $blocked  = $true
+            }
+        }
+
+        if (-not $blocked) {
+
+            Write-MDSection 'Client discovery'
+            if (-not $ClientInfo) { $ClientInfo = Get-MDClientInfo }
+            $clientInfo = $ClientInfo
+
+            Write-MDKeyValue -Key 'Client installed'  -Value $(if ($clientInfo.Installed) { 'yes' } else { 'NO' })
+            Write-MDKeyValue -Key 'Install path'      -Value $clientInfo.InstallPath
+            Write-MDKeyValue -Key 'Client version'    -Value $clientInfo.Version
+            Write-MDKeyValue -Key 'Log directory'     -Value $clientInfo.LogPath
+            Write-MDKeyValue -Key 'Assigned site'     -Value $clientInfo.SiteCode
+            Write-MDKeyValue -Key 'Management point'  -Value $clientInfo.ManagementPoint
+            Write-MDKeyValue -Key 'Client ID'         -Value $clientInfo.ClientId
+            Write-MDKeyValue -Key 'Cache location'    -Value $clientInfo.CacheLocation
+            Write-MDKeyValue -Key 'Cache size (MB)'   -Value $clientInfo.CacheSizeMB
+            Write-MDKeyValue -Key 'HTTPS-only client' -Value $(if ($clientInfo.HttpsOnly) { 'yes' } else { 'no' })
+
+            switch ($Command) {
+
+                # -----------------------------------------------------------
+                'diagnose' {
+                    $findings = Invoke-MDDiagnose -ClientInfo $clientInfo -SkipLogParsing:$SkipLogs `
+                                                  -LogDays $Days -LogWarnings:$IncludeWarnings
+                    $summary  = Write-MDSummary -Findings $findings
+
+                    if     ($summary.Fail -gt 0) { $exitCode = 2 }
+                    elseif ($summary.Warn -gt 0) { $exitCode = 1 }
+                }
+
+                # -----------------------------------------------------------
+                'logs' {
+                    if (-not $clientInfo.LogPath) {
+                        Write-MDFail 'No client log directory could be located, so there is nothing to parse.'
+                        $exitCode = 2
+                    }
+                    else {
+                        Write-MDSection ('CCM log analysis (last {0} day(s))' -f $Days)
+                        $minType = 3
+                        if ($IncludeWarnings) { $minType = 2 }
+
+                        $findings = Invoke-MDLogReport -LogRoot $clientInfo.LogPath -Days $Days -MinType $minType
+                        $summary  = Write-MDSummary -Findings $findings
+
+                        if     ($summary.Fail -gt 0) { $exitCode = 2 }
+                        elseif ($summary.Warn -gt 0) { $exitCode = 1 }
+                    }
+                }
+
+                # -----------------------------------------------------------
+                'repair' {
+                    if (-not $NoDiagnose) {
+                        $findings = Invoke-MDDiagnose -ClientInfo $clientInfo -SkipLogParsing:$SkipLogs `
+                                                      -LogDays $Days -LogWarnings:$IncludeWarnings
+                        $summary  = Write-MDSummary -Findings $findings
+                    }
+                    else {
+                        Write-MDSection 'Diagnostics'
+                        Write-MDSkip 'Skipped (-NoDiagnose). Repairs will be selected from -Only / -All alone.'
+                    }
+
+                    # The tier: the operator's if they named one, otherwise whatever
+                    # the diagnosis concluded. -Only names the actions outright, so
+                    # nothing about it is the diagnosis's recommendation and it is
+                    # not framed as one.
+                    $usingOnly          = ($Only -and @($Only).Count -gt 0)
+                    $effectiveLevel     = $Level
+                    $levelFromDiagnosis = $false
+
+                    if (-not $levelExplicit -and -not $usingOnly -and $summary -and $summary.Recommended) {
+                        $effectiveLevel     = $summary.Recommended
+                        $levelFromDiagnosis = $true
+                    }
+
+                    $context = New-MDRepairContext -ClientInfo $clientInfo -Level $effectiveLevel `
+                                                   -ScriptRoot $script:MDRoot -Findings $findings `
+                                                   -Force:$Force -DryRun:$DryRun
+
+                    $plan = Get-MDRepairPlan -Level $effectiveLevel -Findings $findings -Only $Only -All:$All
+
+                    Write-MDSection ('Repair plan  (tier: {0})' -f $effectiveLevel)
+                    Write-MDLine ''
+
+                    if (-not $plan -or @($plan).Count -eq 0) {
+                        Write-MDOk 'Nothing to repair at this tier. The diagnosis implicated no repair actions.'
+                        Write-MDDetail -Text 'Use -All to run every action at this tier anyway, or -Only <id> to force a specific one.' -Indent 4
+                    }
+                    else {
+                        # Which repairs, and - just as importantly - why each one.
+                        Write-MDRepairRationale -Plan $plan -Findings $findings -Context $context
+
+                        if ($levelFromDiagnosis) {
+                            Write-MDLine ''
+                            Write-MDInfo 'Tier chosen by the diagnosis. Pass -Level to override it.'
+                        }
+
+                        Write-MDLine ''
+                        if ($DryRun) {
+                            Write-MDInfo 'Dry run: every action below reports what it would do and changes nothing.'
+                        }
+
+                        $aggressive = @($plan | Where-Object { $_.Level -eq 'Aggressive' })
+                        $proceed    = $true
+
+                        # ---- the gate ------------------------------------------
+                        # Nothing below this point runs until the operator has said
+                        # yes. -DryRun skips it because nothing is changed either
+                        # way. Reaching here from the menu changes nothing: the menu
+                        # chooses the options, this question decides the run.
+                        if (-not $DryRun) {
+                            Write-MDSection 'Confirmation'
+                            Write-MDLine ''
+
+                            $question = if ($levelFromDiagnosis) {
+                                'Diagnosis recommends {0} repairs. Continue?' -f $effectiveLevel
+                            } else {
+                                'Run {0} repair action(s) at the {1} tier on {2}. Continue?' -f @($plan).Count, $effectiveLevel, $env:COMPUTERNAME
+                            }
+
+                            # No -DefaultYes: a bare Enter, or a Read-Host that
+                            # returns nothing because stdin is not a console, must
+                            # not start repairs. Unattended runs say so explicitly
+                            # with -Force.
+                            $proceed = Read-MDConfirm -Question $question -Force:$Force
+
+                            # Destructive actions are agreed to separately, and each
+                            # one asks again for itself when it runs.
+                            if ($proceed -and $aggressive.Count -gt 0) {
+                                Write-MDLine ''
+                                Write-MDWarn ('This plan contains {0} DESTRUCTIVE action(s):' -f $aggressive.Count)
+                                foreach ($a in $aggressive) { Write-MDDetail -Text $a.Id -Indent 6 -Bullet '! ' -Color 'DarkYellow' }
+                                Write-MDDetail -Indent 6 -Color 'DarkYellow' -Text @(
+                                    'These discard state that does not come back on its own, and can require a reboot or a client reinstall afterwards.'
+                                    'Each one explains what it costs and asks again before it does anything.'
+                                )
+                                Write-MDLine ''
+                                $proceed = Read-MDConfirm -Question ('Include the destructive action(s) in this run on {0}?' -f $env:COMPUTERNAME) -Force:$Force
+                            }
+                        }
+
+                        if (-not $proceed) {
+                            Write-MDSkip 'Repair cancelled by the operator. Nothing was changed.'
+                        }
+                        else {
+                            Write-MDSection 'Repair actions'
+                            $repairResults = Invoke-MDRepairPlan -Plan $plan -Context $context
+
+                            $repairSummary = Write-MDRepairSummary -Results $repairResults
+                            if ($repairSummary.Failed -gt 0) { $exitCode = 3 }
+                        }
+                    }
+
+                    # -Verify re-reads the machine so the operator can see the delta
+                    # rather than taking the repair results on trust.
+                    if ($Verify -and -not $DryRun) {
+                        Write-MDSection 'Verification pass'
+                        Write-MDInfo 'Some repairs are asynchronous - registration, policy download and update scans can take 15+ minutes to settle.'
+
+                        $clientInfo = Get-MDClientInfo
+                        $findings   = Invoke-MDDiagnose -ClientInfo $clientInfo -SkipLogParsing `
+                                                        -LogDays $Days -LogWarnings:$IncludeWarnings
+                        $summary    = Write-MDSummary -Findings $findings
+
+                        if ($exitCode -eq 0) {
+                            if     ($summary.Fail -gt 0) { $exitCode = 2 }
+                            elseif ($summary.Warn -gt 0) { $exitCode = 1 }
+                        }
+                    }
+                }
+
+                # -----------------------------------------------------------
+                'bundle' {
+                    # A bundle is a diagnosis plus everything that makes the
+                    # diagnosis interpretable by someone who is not sitting at
+                    # this machine.
+                    $findings = Invoke-MDDiagnose -ClientInfo $clientInfo -SkipLogParsing:$SkipLogs `
+                                                  -LogDays $Days -LogWarnings:$IncludeWarnings
+                    $summary  = Write-MDSummary -Findings $findings
+
+                    Write-MDSection 'Support bundle'
+                    Write-MDLine ''
+
+                    $zip = New-MDSupportBundle -ClientInfo $clientInfo -Findings $findings -HostFacts $facts `
+                                               -OutputPath $BundlePath -Version $script:MDVersion -SkipLogs:$SkipLogs
+
+                    Write-MDLine ''
+                    if ($zip -and (Test-Path -LiteralPath $zip)) {
+                        $bundleZip = $zip
+                        $zipSize   = (Get-Item -LiteralPath $zip).Length
+                        Write-MDOk ('Support bundle written: {0}' -f $zip)
+                        Write-MDKeyValue -Key 'Bundle' -Value $zip -Indent 4
+                        Write-MDKeyValue -Key 'Size'   -Value (Format-MDBytes $zipSize) -Indent 4
+                        Write-MDDetail -Indent 4 -Text 'Read README.txt inside the ZIP for what it contains and what was deliberately left out.'
+
+                        if     ($summary.Fail -gt 0) { $exitCode = 2 }
+                        elseif ($summary.Warn -gt 0) { $exitCode = 1 }
+                    }
+                    else {
+                        Write-MDFail 'The support bundle could not be produced.'
+                        $exitCode = 4
+                    }
+                }
+
+                # -----------------------------------------------------------
+                'reinstall' {
+                    Write-MDSection 'Client reinstall'
+
+                    $context = New-MDRepairContext -ClientInfo $clientInfo -Level 'Aggressive' `
+                                                   -ScriptRoot $script:MDRoot -Force:$Force -DryRun:$DryRun
+
+                    $custom = Find-MDCustomReinstallScript -ScriptRoot $script:MDRoot
+                    if ($custom) {
+                        Write-MDOk ("Custom reinstall script found: {0}" -f $custom)
+                    }
+                    else {
+                        Write-MDWarn 'No ClientReinstall.ps1 found. Falling back to ccmsetup.exe with the discovered site parameters.'
+                        Write-MDDetail -Text 'Searched the script folder, its parent, and the current directory.' -Bullet '- '
+                        Write-MDDetail -Text 'Copy ClientReinstall.example.ps1 to ClientReinstall.ps1 and edit it to control exactly how the client is installed.' -Bullet '> ' -Color 'DarkYellow'
+                    }
+
+                    Set-MDStepTotal 1
+                    Write-MDStep 'reinstall the Configuration Manager client'
+
+                    $result        = Repair-MDClientReinstall -Context $context
+                    $result | Write-MDRepairResult
+                    $repairResults = @($result)
+
+                    $repairSummary = Write-MDRepairSummary -Results $repairResults
+                    if ($repairSummary.Failed -gt 0) { $exitCode = 3 }
+                }
+            }
+
+            # ---- optional JSON export -------------------------------------
+            if ($Json) {
+                Write-MDSection 'Report export'
+                [void](Export-MDReport -Path $Json -ClientInfo $clientInfo -Findings $findings `
+                                       -RepairResults $repairResults -HostFacts $facts `
+                                       -Command $Command -Version $script:MDVersion)
+            }
+        }
+
+        $note = if ($blocked) { 'aborted: not elevated' } else {
+            switch ($exitCode) {
+                0 { 'healthy / completed' }
+                1 { 'completed with warnings' }
+                2 { 'problems found' }
+                3 { 'one or more repair actions failed' }
+                4 { 'could not produce the requested output' }
+                default { 'completed' }
+            }
+        }
+        Write-MDFooter -ExitNote ('exit {0} - {1}' -f $exitCode, $note)
+    }
+    catch {
+        # Anything that escapes every local handler lands here. Print it
+        # properly rather than letting PowerShell dump a raw stack trace on the
+        # operator - and, in the menu, do not take the whole session down with
+        # one failed command.
+        Write-MDLine ''
+        Write-MDFail ('Unhandled error: {0}' -f $_.Exception.Message)
+        Write-MDDetail -Text $_.ScriptStackTrace -Bullet '| '
+        Write-MDFooter -ExitNote 'aborted: unhandled error'
+        $exitCode = 4
+    }
+
+    $script:MDLastRun = [pscustomobject]@{
+        Command       = $Command
+        ExitCode      = $exitCode
+        Summary       = $summary
+        RepairSummary = $repairSummary
+        Findings      = $findings
+        RepairResults = $repairResults
+        BundlePath    = $bundleZip
+        ClientInfo    = $ClientInfo
+        Transcript    = $script:MDLog.PlainPath
+    }
+}
+
+
+# ---------------------------------------------------------------------------
+# The menu loop
+# ---------------------------------------------------------------------------
+function Invoke-MDMenuLoop {
+<#
+    .SYNOPSIS
+        Draws the menu, runs whatever it produces, and comes back for more.
+    .DESCRIPTION
+        Every command still goes through Invoke-MDCommand with an options
+        hashtable, so a menu-driven run and a command-line run are the same
+        run. The loop's only extra jobs are keeping the machine facts current
+        and giving each command its own transcript.
+
+        Leaves the exit code in $script:MDMenuExitCode.
+    .PARAMETER Options
+        The command line the menu was started with, used as its defaults.
+#>
+    param([Parameter(Mandatory)][hashtable] $Options)
+
+    Initialize-MDMenu -Defaults $Options -LogDirectory $LogDirectory -ScriptRoot $script:MDRoot -NoClear:$NoClear
+
+    $script:MDMenuExitCode = 0
+    $pending = $null       # a command handed over by the previous screen
+
+    while ($true) {
+
+        # Host facts and client state are re-read after anything that could
+        # have changed them, and not otherwise: on a broken client the WMI
+        # queries behind them are the slow part of drawing this menu.
+        if ($script:MDMenu.NeedsRefresh) {
+            $script:MDMenu.Facts        = Get-MDHostFacts
+            $script:MDMenu.ClientInfo   = Get-MDClientInfo
+            $script:MDMenu.NeedsRefresh = $false
+        }
+
+        $choice  = $pending
+        $pending = $null
+        if (-not $choice) { $choice = Show-MDMainMenu }
+
+        if ($choice -eq $script:MDMenuQuit) { break }
+
+        if ($choice -eq 'help') {
+            Clear-MDScreen
+            Show-MDHelp
+            Read-MDMenuPause
+            continue
+        }
+
+        if ($choice -eq 'logfolder') {
+            Open-MDFolder -Path $LogDirectory
+            Read-MDMenuPause
+            continue
+        }
+
+        if ($choice -eq 'elevate') {
+            if (Invoke-MDElevate -ScriptRoot $script:MDRoot) { break }
+            continue
+        }
+
+        # ---- the wizard for the chosen command ----------------------------
+        $request = Get-MDMenuRunRequest -Command $choice
+
+        if ($request -isnot [hashtable]) {
+            if ($request -eq $script:MDMenuQuit) { break }
+            if ($request -eq $script:MDMenuBack) { continue }
+
+            # A wizard is allowed to hand the operator somewhere better than
+            # where they were going: reinstall offers a diagnosis instead.
+            $pending = $request
+            continue
+        }
+
+        # What was chosen this time becomes the defaults for next time.
+        $script:MDMenu.Defaults = $request
+
+        # ---- run it --------------------------------------------------------
+        # Each command gets its own pair of transcripts, named for it, exactly
+        # as though it had been run from the command line.
+        Clear-MDScreen
+        Initialize-MDConsole -LogDirectory $LogDirectory -NoColor:$NoColor -Quiet:$Quiet `
+                             -DebugOutput:$Trace -Tag $request.Command
+
+        Write-MDLine ''
+        Write-MDInfo ('Running:  ' + (Get-MDCommandLine -Options $request))
+
+        # Host facts are re-read per run rather than reused from the menu: they
+        # carry the start time and the uptime, and a banner that reports when
+        # the menu opened rather than when the command ran is a lie in the
+        # transcript.
+        Invoke-MDCommand -Options $request -ClientInfo $script:MDMenu.ClientInfo | Out-Null
+
+        $run = $script:MDLastRun
+        if ($run) { $script:MDMenuExitCode = [int]$run.ExitCode }
+
+        # Anything that wrote to the machine invalidates what the menu shows.
+        if ($request.Command -in @('repair', 'reinstall') -and -not $request.DryRun) {
+            $script:MDMenu.NeedsRefresh = $true
+        }
+
+        $next = Show-MDPostRun -Options $request -Run $run
+
+        # Menu navigation does not belong in a finished run's transcript, so
+        # the engine goes back to console-only until the next command starts.
+        Initialize-MDConsole -NoColor:$NoColor -Quiet:$Quiet -DebugOutput:$Trace -Tag 'menu'
+
+        if ($next -eq $script:MDMenuQuit) { break }
+        if ($next -ne 'menu') { $pending = $next }
+    }
+
+    Clear-MDScreen
+    Write-MDLine ''
+    Write-MDLine '  mecmdoctor - finished. Everything it did is in the transcripts.' -Color $script:MDColors.Accent
+    if ($LogDirectory) { Write-MDKeyValue -Key 'Log folder' -Value $LogDirectory }
+    Write-MDLine ''
+}
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-# Version and help need no logging setup or elevation.
+# Version needs no logging setup, no elevation and no menu.
 if ($Command -eq 'version') {
     Write-Host ("mecmdoctor {0}" -f $script:MDVersion)
     exit 0
+}
+
+# The command line, as an options object. The menu edits a copy of this; the
+# command line runs it as it stands.
+$cliOptions = New-MDRunOptions -Command $Command -From @{
+    Level           = $Level
+    LevelExplicit   = $script:MDLevelExplicit
+    Only            = @($Only)
+    All             = [bool]$All
+    NoDiagnose      = [bool]$NoDiagnose
+    Verify          = [bool]$Verify
+    Force           = [bool]$Force
+    DryRun          = [bool]$DryRun
+    Days            = $Days
+    IncludeWarnings = [bool]$IncludeWarnings
+    SkipLogs        = [bool]$SkipLogs
+    Json            = $Json
+    BundlePath      = $BundlePath
+}
+
+# A scheduled task, an MECM script deployment or a remote session has nobody
+# to answer a menu. Do the useful thing instead of hanging on a prompt.
+$menuFellBack = $false
+if ($Command -eq 'menu' -and -not (Test-MDMenuCapable)) {
+    $Command            = 'diagnose'
+    $cliOptions.Command = 'diagnose'
+    $menuFellBack       = $true
+}
+
+if ($Command -eq 'menu') {
+    # No log directory: menu navigation is not a run, and should not leave a
+    # transcript of its own behind. Each command opens its own when it starts.
+    Initialize-MDConsole -NoColor:$NoColor -Quiet:$Quiet -DebugOutput:$Trace -Tag 'menu'
+    Invoke-MDMenuLoop -Options $cliOptions | Out-Null
+    exit $script:MDMenuExitCode
 }
 
 Initialize-MDConsole -LogDirectory $LogDirectory -NoColor:$NoColor -Quiet:$Quiet -DebugOutput:$Trace -Tag $Command
@@ -418,277 +941,12 @@ if ($Command -eq 'help') {
     exit 0
 }
 
+if ($menuFellBack) {
+    Write-MDInfo 'No interactive console, so the menu was skipped and a diagnosis was run instead.'
+}
+
+Invoke-MDCommand -Options $cliOptions | Out-Null
+
 $exitCode = 0
-
-try {
-    $facts = Get-MDHostFacts
-    Write-MDBanner -Version $script:MDVersion -Command $Command -Facts $facts
-
-    if (-not (Test-MDAdmin)) {
-        Write-MDWarn 'Not running elevated. Many checks will return incomplete results and no repair can be applied.'
-        Write-MDDetail -Text 'Re-run using mecmdoctor.bat, which requests elevation automatically.' -Bullet '> ' -Color 'DarkYellow'
-
-        # Read-only commands can still produce something useful; repairs cannot.
-        if ($Command -in @('repair', 'reinstall')) {
-            Write-MDFail 'Refusing to attempt repairs without administrative rights.'
-            Write-MDFooter -ExitNote 'aborted: not elevated'
-            exit 4
-        }
-    }
-
-    Write-MDSection 'Client discovery'
-    $clientInfo = Get-MDClientInfo
-
-    Write-MDKeyValue -Key 'Client installed'  -Value $(if ($clientInfo.Installed) { 'yes' } else { 'NO' })
-    Write-MDKeyValue -Key 'Install path'      -Value $clientInfo.InstallPath
-    Write-MDKeyValue -Key 'Client version'    -Value $clientInfo.Version
-    Write-MDKeyValue -Key 'Log directory'     -Value $clientInfo.LogPath
-    Write-MDKeyValue -Key 'Assigned site'     -Value $clientInfo.SiteCode
-    Write-MDKeyValue -Key 'Management point'  -Value $clientInfo.ManagementPoint
-    Write-MDKeyValue -Key 'Client ID'         -Value $clientInfo.ClientId
-    Write-MDKeyValue -Key 'Cache location'    -Value $clientInfo.CacheLocation
-    Write-MDKeyValue -Key 'Cache size (MB)'   -Value $clientInfo.CacheSizeMB
-    Write-MDKeyValue -Key 'HTTPS-only client' -Value $(if ($clientInfo.HttpsOnly) { 'yes' } else { 'no' })
-
-    $findings      = @()
-    $repairResults = @()
-    $summary       = $null
-
-    switch ($Command) {
-
-        # -------------------------------------------------------------------
-        'diagnose' {
-            $findings = Invoke-MDDiagnose -ClientInfo $clientInfo -SkipLogParsing:$SkipLogs `
-                                          -LogDays $Days -LogWarnings:$IncludeWarnings
-            $summary  = Write-MDSummary -Findings $findings
-
-            if     ($summary.Fail -gt 0) { $exitCode = 2 }
-            elseif ($summary.Warn -gt 0) { $exitCode = 1 }
-        }
-
-        # -------------------------------------------------------------------
-        'logs' {
-            if (-not $clientInfo.LogPath) {
-                Write-MDFail 'No client log directory could be located, so there is nothing to parse.'
-                $exitCode = 2
-            }
-            else {
-                Write-MDSection ('CCM log analysis (last {0} day(s))' -f $Days)
-                $minType = 3
-                if ($IncludeWarnings) { $minType = 2 }
-
-                $findings = Invoke-MDLogReport -LogRoot $clientInfo.LogPath -Days $Days -MinType $minType
-                $summary  = Write-MDSummary -Findings $findings
-
-                if     ($summary.Fail -gt 0) { $exitCode = 2 }
-                elseif ($summary.Warn -gt 0) { $exitCode = 1 }
-            }
-        }
-
-        # -------------------------------------------------------------------
-        'repair' {
-            if (-not $NoDiagnose) {
-                $findings = Invoke-MDDiagnose -ClientInfo $clientInfo -SkipLogParsing:$SkipLogs `
-                                              -LogDays $Days -LogWarnings:$IncludeWarnings
-                $summary  = Write-MDSummary -Findings $findings
-            }
-            else {
-                Write-MDSection 'Diagnostics'
-                Write-MDSkip 'Skipped (-NoDiagnose). Repairs will be selected from -Only / -All alone.'
-            }
-
-            # The tier: the operator's if they named one, otherwise whatever the
-            # diagnosis concluded. -Only names the actions outright, so nothing
-            # about it is the diagnosis's recommendation and it is not framed
-            # as one.
-            $usingOnly          = ($Only -and @($Only).Count -gt 0)
-            $effectiveLevel     = $Level
-            $levelFromDiagnosis = $false
-
-            if (-not $script:MDLevelExplicit -and -not $usingOnly -and $summary -and $summary.Recommended) {
-                $effectiveLevel     = $summary.Recommended
-                $levelFromDiagnosis = $true
-            }
-
-            $context = New-MDRepairContext -ClientInfo $clientInfo -Level $effectiveLevel `
-                                           -ScriptRoot $script:MDRoot -Findings $findings `
-                                           -Force:$Force -DryRun:$DryRun
-
-            $plan = Get-MDRepairPlan -Level $effectiveLevel -Findings $findings -Only $Only -All:$All
-
-            Write-MDSection ('Repair plan  (tier: {0})' -f $effectiveLevel)
-            Write-MDLine ''
-
-            if (-not $plan -or @($plan).Count -eq 0) {
-                Write-MDOk 'Nothing to repair at this tier. The diagnosis implicated no repair actions.'
-                Write-MDDetail -Text 'Use -All to run every action at this tier anyway, or -Only <id> to force a specific one.' -Indent 4
-            }
-            else {
-                # Which repairs, and - just as importantly - why each one.
-                Write-MDRepairRationale -Plan $plan -Findings $findings -Context $context
-
-                if ($levelFromDiagnosis) {
-                    Write-MDLine ''
-                    Write-MDInfo 'Tier chosen by the diagnosis. Pass -Level to override it.'
-                }
-
-                Write-MDLine ''
-                if ($DryRun) {
-                    Write-MDInfo 'Dry run: every action below reports what it would do and changes nothing.'
-                }
-
-                $aggressive = @($plan | Where-Object { $_.Level -eq 'Aggressive' })
-                $proceed    = $true
-
-                # ---- the gate --------------------------------------------------
-                # Nothing below this point runs until the operator has said yes.
-                # -DryRun skips it because nothing is changed either way.
-                if (-not $DryRun) {
-                    Write-MDSection 'Confirmation'
-                    Write-MDLine ''
-
-                    $question = if ($levelFromDiagnosis) {
-                        'Diagnosis recommends {0} repairs. Continue?' -f $effectiveLevel
-                    } else {
-                        'Run {0} repair action(s) at the {1} tier on {2}. Continue?' -f @($plan).Count, $effectiveLevel, $env:COMPUTERNAME
-                    }
-
-                    # No -DefaultYes: a bare Enter, or a Read-Host that returns
-                    # nothing because stdin is not a console, must not start
-                    # repairs. Unattended runs say so explicitly with -Force.
-                    $proceed = Read-MDConfirm -Question $question -Force:$Force
-
-                    # Destructive actions are agreed to separately, and each one
-                    # asks again for itself when it runs.
-                    if ($proceed -and $aggressive.Count -gt 0) {
-                        Write-MDLine ''
-                        Write-MDWarn ('This plan contains {0} DESTRUCTIVE action(s):' -f $aggressive.Count)
-                        foreach ($a in $aggressive) { Write-MDDetail -Text $a.Id -Indent 6 -Bullet '! ' -Color 'DarkYellow' }
-                        Write-MDDetail -Indent 6 -Color 'DarkYellow' -Text @(
-                            'These discard state that does not come back on its own, and can require a reboot or a client reinstall afterwards.'
-                            'Each one explains what it costs and asks again before it does anything.'
-                        )
-                        Write-MDLine ''
-                        $proceed = Read-MDConfirm -Question ('Include the destructive action(s) in this run on {0}?' -f $env:COMPUTERNAME) -Force:$Force
-                    }
-                }
-
-                if (-not $proceed) {
-                    Write-MDSkip 'Repair cancelled by the operator. Nothing was changed.'
-                }
-                else {
-                    Write-MDSection 'Repair actions'
-                    $repairResults = Invoke-MDRepairPlan -Plan $plan -Context $context
-
-                    $repairSummary = Write-MDRepairSummary -Results $repairResults
-                    if ($repairSummary.Failed -gt 0) { $exitCode = 3 }
-                }
-            }
-
-            # -Verify re-reads the machine so the operator can see the delta
-            # rather than taking the repair results on trust.
-            if ($Verify -and -not $DryRun) {
-                Write-MDSection 'Verification pass'
-                Write-MDInfo 'Some repairs are asynchronous - registration, policy download and update scans can take 15+ minutes to settle.'
-
-                $clientInfo = Get-MDClientInfo
-                $findings   = Invoke-MDDiagnose -ClientInfo $clientInfo -SkipLogParsing `
-                                                -LogDays $Days -LogWarnings:$IncludeWarnings
-                $summary    = Write-MDSummary -Findings $findings
-
-                if ($exitCode -eq 0) {
-                    if     ($summary.Fail -gt 0) { $exitCode = 2 }
-                    elseif ($summary.Warn -gt 0) { $exitCode = 1 }
-                }
-            }
-        }
-
-        # -------------------------------------------------------------------
-        'bundle' {
-            # A bundle is a diagnosis plus everything that makes the diagnosis
-            # interpretable by someone who is not sitting at this machine.
-            $findings = Invoke-MDDiagnose -ClientInfo $clientInfo -SkipLogParsing:$SkipLogs `
-                                          -LogDays $Days -LogWarnings:$IncludeWarnings
-            $summary  = Write-MDSummary -Findings $findings
-
-            Write-MDSection 'Support bundle'
-            Write-MDLine ''
-
-            $zip = New-MDSupportBundle -ClientInfo $clientInfo -Findings $findings -HostFacts $facts `
-                                       -OutputPath $BundlePath -Version $script:MDVersion -SkipLogs:$SkipLogs
-
-            Write-MDLine ''
-            if ($zip -and (Test-Path -LiteralPath $zip)) {
-                $zipSize = (Get-Item -LiteralPath $zip).Length
-                Write-MDOk ('Support bundle written: {0}' -f $zip)
-                Write-MDKeyValue -Key 'Bundle' -Value $zip -Indent 4
-                Write-MDKeyValue -Key 'Size'   -Value (Format-MDBytes $zipSize) -Indent 4
-                Write-MDDetail -Indent 4 -Text 'Read README.txt inside the ZIP for what it contains and what was deliberately left out.'
-
-                if     ($summary.Fail -gt 0) { $exitCode = 2 }
-                elseif ($summary.Warn -gt 0) { $exitCode = 1 }
-            }
-            else {
-                Write-MDFail 'The support bundle could not be produced.'
-                $exitCode = 4
-            }
-        }
-
-        # -------------------------------------------------------------------
-        'reinstall' {
-            Write-MDSection 'Client reinstall'
-
-            $context = New-MDRepairContext -ClientInfo $clientInfo -Level 'Aggressive' `
-                                           -ScriptRoot $script:MDRoot -Force:$Force -DryRun:$DryRun
-
-            $custom = Find-MDCustomReinstallScript -ScriptRoot $script:MDRoot
-            if ($custom) {
-                Write-MDOk ("Custom reinstall script found: {0}" -f $custom)
-            }
-            else {
-                Write-MDWarn 'No ClientReinstall.ps1 found. Falling back to ccmsetup.exe with the discovered site parameters.'
-                Write-MDDetail -Text 'Searched the script folder, its parent, and the current directory.' -Bullet '- '
-                Write-MDDetail -Text 'Copy ClientReinstall.example.ps1 to ClientReinstall.ps1 and edit it to control exactly how the client is installed.' -Bullet '> ' -Color 'DarkYellow'
-            }
-
-            Set-MDStepTotal 1
-            Write-MDStep 'reinstall the Configuration Manager client'
-
-            $result        = Repair-MDClientReinstall -Context $context
-            $result | Write-MDRepairResult
-            $repairResults = @($result)
-
-            $repairSummary = Write-MDRepairSummary -Results $repairResults
-            if ($repairSummary.Failed -gt 0) { $exitCode = 3 }
-        }
-    }
-
-    # ---- optional JSON export ---------------------------------------------
-    if ($Json) {
-        Write-MDSection 'Report export'
-        [void](Export-MDReport -Path $Json -ClientInfo $clientInfo -Findings $findings `
-                               -RepairResults $repairResults -HostFacts $facts `
-                               -Command $Command -Version $script:MDVersion)
-    }
-
-    $note = switch ($exitCode) {
-        0 { 'healthy / completed' }
-        1 { 'completed with warnings' }
-        2 { 'problems found' }
-        3 { 'one or more repair actions failed' }
-        4 { 'could not produce the requested output' }
-        default { 'completed' }
-    }
-    Write-MDFooter -ExitNote ('exit {0} - {1}' -f $exitCode, $note)
-}
-catch {
-    # Anything that escapes every local handler lands here. Print it properly
-    # rather than letting PowerShell dump a raw stack trace on the operator.
-    Write-MDLine ''
-    Write-MDFail ('Unhandled error: {0}' -f $_.Exception.Message)
-    Write-MDDetail -Text $_.ScriptStackTrace -Bullet '| '
-    Write-MDFooter -ExitNote 'aborted: unhandled error'
-    $exitCode = 4
-}
-
+if ($script:MDLastRun) { $exitCode = [int]$script:MDLastRun.ExitCode }
 exit $exitCode

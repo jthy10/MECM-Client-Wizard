@@ -79,7 +79,7 @@ function Write-MDBundleFile {
             New-Item -Path $dir -ItemType Directory -Force -ErrorAction Stop | Out-Null
         }
         Set-Content -LiteralPath $path -Value $Lines -Encoding UTF8 -ErrorAction Stop
-        Write-MDDetail -Text ('{0} ({1} line(s))' -f $Name, $Lines.Count) -Bullet '- '
+        Write-MDDetail -Text ('{0} ({1} line(s))' -f $Name, $Lines.Count) -Bullet '- ' -Chatter
         return $true
     }
     catch {

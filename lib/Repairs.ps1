@@ -1340,7 +1340,7 @@ function Repair-MDClientReinstall {
             if ($available -contains 'SiteCode'        -and $Context.ClientInfo.SiteCode)        { $splat['SiteCode']        = $Context.ClientInfo.SiteCode }
             if ($available -contains 'ManagementPoint' -and $Context.ClientInfo.ManagementPoint) { $splat['ManagementPoint'] = $Context.ClientInfo.ManagementPoint }
             if ($available -contains 'InstallPath'     -and $Context.ClientInfo.InstallPath)     { $splat['InstallPath']     = $Context.ClientInfo.InstallPath }
-            if ($available -contains 'LogDirectory')                                            { $splat['LogDirectory']    = (Split-Path -Parent $script:MDLog.PlainPath) }
+            if ($available -contains 'LogDirectory' -and $script:MDLog.PlainPath)               { $splat['LogDirectory']    = (Split-Path -Parent $script:MDLog.PlainPath) }
         }
         catch {
             Write-MDDebug ("could not inspect custom script parameters: {0}" -f $_.Exception.Message)
@@ -1577,7 +1577,11 @@ function Invoke-MDRepairPlan {
 
     foreach ($entry in $plan) {
         Write-MDStep ("repair: {0}" -f $entry.Id)
-        Write-MDInfo ('tier: {0}{1}' -f $entry.Level, $(if ($Context.DryRun) { '   (dry run - nothing will be changed)' } else { '' }))
+
+        # Chatter: the tier is already on the plan heading, and under -Quiet the
+        # step heading this line sits under is not on screen to belong to. The
+        # result line below names the action either way.
+        Write-MDInfo -Chatter ('tier: {0}{1}' -f $entry.Level, $(if ($Context.DryRun) { '   (dry run - nothing will be changed)' } else { '' }))
 
         try {
             $result = & $entry.Action $Context

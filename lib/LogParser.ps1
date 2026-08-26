@@ -504,7 +504,7 @@ function Invoke-MDLogReport {
         $issues = Get-MDLogIssues -LogRoot $LogRoot -Area $area -Since $since -MinType $MinType -MaxPerLog $MaxPerLog
 
         if (-not $issues -or $issues.Count -eq 0) {
-            Write-MDOk ("No errors in the last {0} day(s) across: {1}" -f $Days, (($logsInArea | ForEach-Object { [System.IO.Path]::GetFileName($_.Name) }) -join ', '))
+            Write-MDOk -Chatter ("No errors in the last {0} day(s) across: {1}" -f $Days, (($logsInArea | ForEach-Object { [System.IO.Path]::GetFileName($_.Name) }) -join ', '))
             $findings.Add((New-MDFinding -Category 'Logs' -Title ("$area logs") -Status 'Pass' `
                 -Detail ("clean over the last $Days day(s)"))) | Out-Null
             continue

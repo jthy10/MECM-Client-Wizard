@@ -17,7 +17,8 @@ rem    3. passes every argument through to MECMDoctor.ps1 untouched
 rem    4. keeps the window open when it was started by double-click
 rem
 rem  Usage:
-rem    mecmdoctor                      same as: mecmdoctor diagnose
+rem    mecmdoctor                      the menu - pick a command, answer a few
+rem                                    questions, watch it run, pick the next
 rem    mecmdoctor diagnose
 rem    mecmdoctor repair -Level Safe
 rem    mecmdoctor logs -Days 14
@@ -84,6 +85,7 @@ if not defined FIRSTARG goto elevation_check
 set "FIRSTCHAR=!FIRSTARG:~0,1!"
 if "!FIRSTCHAR!"=="-" goto elevation_check
 if "!FIRSTCHAR!"=="/" goto elevation_check
+if /i "!FIRSTARG!"=="menu"      goto elevation_check
 if /i "!FIRSTARG!"=="diagnose"  goto elevation_check
 if /i "!FIRSTARG!"=="repair"    goto elevation_check
 if /i "!FIRSTARG!"=="logs"      goto elevation_check
@@ -92,7 +94,7 @@ if /i "!FIRSTARG!"=="reinstall" goto elevation_check
 
 echo.
 echo   [FAIL] Unknown command: !FIRSTARG!
-echo          Valid commands: diagnose, repair, logs, bundle, reinstall, help, version
+echo          Valid commands: menu, diagnose, repair, logs, bundle, reinstall, help, version
 echo          Run "mecmdoctor help" for the full usage.
 echo.
 if defined PAUSEATEND pause
