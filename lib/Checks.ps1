@@ -692,7 +692,11 @@ function Test-MDWmiHealth {
                     if ($_.Message -match 'ResultCode\s*=\s*(0x[0-9A-Fa-f]+)') { $Matches[1] } else { 'no result code' }
                 } | Group-Object | Sort-Object Count -Descending | Select-Object -First 4
 
-            $evidence = foreach ($c in $codes) {
+            # The @() is load-bearing. A machine whose WMI errors all share one
+            # result code makes this foreach yield a single string, and both the
+            # += below and the + at the Info finding then concatenate onto it
+            # instead of appending, so two evidence lines render as one.
+            $evidence = @(foreach ($c in $codes) {
                 $translated = Resolve-MDError $c.Name
                 if ($translated -and $translated.Known) {
                     '{0} x{1} - {2}: {3}' -f $c.Name, $c.Count, $translated.Name, $translated.Means
@@ -700,7 +704,7 @@ function Test-MDWmiHealth {
                 else {
                     '{0} x{1}' -f $c.Name, $c.Count
                 }
-            }
+            })
 
             # Failures against a root\ccm namespace are the ones that actually
             # implicate the client rather than some unrelated agent.

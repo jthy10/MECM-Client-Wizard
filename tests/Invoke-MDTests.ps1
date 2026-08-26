@@ -326,6 +326,29 @@ Test-Case 'a consistent repository refuses the reset even when asked directly' {
     Assert-True ($r.Status -ne 'Success') 'the reset ran on a consistent repository'
 }
 
+Test-Case 'evidence lines survive a single-element result set' {
+    # A machine whose WMI errors all share one result code used to collapse the
+    # provider-error evidence into one concatenated line, because an unwrapped
+    # foreach yields a scalar and + on a string concatenates.
+    # The appended sentence is only ever a line of its own, so wherever it
+    # appears it has to start the line. Anything else means it was glued to
+    # the tail of the previous entry.
+    $sentinel = 'Windows logs a WMI'
+    $findings = @(Test-MDWmiHealth -ClientInfo (Get-MDClientInfo) 6>$null)
+    foreach ($f in $findings) {
+        foreach ($line in @($f.Evidence)) {
+            if ($line -match [regex]::Escape($sentinel)) {
+                Assert-True ($line.StartsWith($sentinel)) ('evidence lines were concatenated: ' + $line)
+            }
+        }
+    }
+
+    # The same shape, exercised directly: one line in, one line appended, two out.
+    $one = @(foreach ($x in @('single')) { $x })
+    $two = $one + 'appended'
+    Assert-Equal 2 @($two).Count 'a one-element collection did not survive being appended to'
+}
+
 Test-Case 'the live WMI check attaches no reset to the size finding' {
     $findings = @(Test-MDWmiHealth -ClientInfo (Get-MDClientInfo) 6>$null)
     foreach ($f in ($findings | Where-Object { $_.Title -eq 'Repository size' })) {
