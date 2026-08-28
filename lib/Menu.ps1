@@ -1403,8 +1403,19 @@ function Open-MDFolder {
         return
     }
 
+    # Server Core ships no Explorer at all, so falling into the catch below
+    # would report a deliberately absent OS feature as a failure. Printing the
+    # path is the entire useful outcome either way - checking first just stops
+    # it looking like something went wrong.
+    $explorer = Join-Path $env:windir 'explorer.exe'
+    if (-not (Test-Path -LiteralPath $explorer)) {
+        Write-MDInfo 'This installation has no Explorer (Server Core), so here is the path instead.'
+        Write-MDKeyValue -Key 'Folder' -Value $Path -Indent 4
+        return
+    }
+
     try {
-        Start-Process -FilePath 'explorer.exe' -ArgumentList ('"' + $Path + '"') -ErrorAction Stop
+        Start-Process -FilePath $explorer -ArgumentList ('"' + $Path + '"') -ErrorAction Stop
         Write-MDOk ('Opened {0}' -f $Path)
     }
     catch {

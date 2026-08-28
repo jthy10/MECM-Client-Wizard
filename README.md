@@ -59,6 +59,10 @@ powershell -ExecutionPolicy Bypass -File .\MECMDoctor.ps1 diagnose
 **Requirements:** Windows PowerShell 5.1 (shipped with Windows 8.1 / Server 2012 R2 and later).
 No modules to install. Administrator rights are required for repairs and for several checks.
 
+Server Core works, including the menu — nothing here needs a GUI, and every check reads CIM, the
+registry, services, the event log or the file system. The one difference is the menu's *open log
+folder* action, which prints the path rather than opening Explorer, because Server Core has none.
+
 ---
 
 ## Commands

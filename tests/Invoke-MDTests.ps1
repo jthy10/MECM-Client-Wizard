@@ -1082,6 +1082,52 @@ Test-Case 'every -Quiet suppression happens through the one switch' {
 
 
 # ===========================================================================
+#  10. Server Core
+# ===========================================================================
+Write-Host ''
+Write-Host '  Server Core' -ForegroundColor White
+
+Test-Case 'nothing in the tool depends on a GUI' {
+    # The README states Server Core works. This is what keeps that true: an
+    # accidental Out-GridView or Windows.Forms dependency would break a whole
+    # class of machine that nobody developing this is likely to be sitting at.
+    $banned = @(
+        @{ Pattern = 'Out-GridView';           What = 'Out-GridView' }
+        @{ Pattern = 'System\.Windows\.Forms'; What = 'the WinForms assembly' }
+        @{ Pattern = 'PresentationFramework';  What = 'the WPF assembly' }
+        @{ Pattern = 'System\.Drawing';        What = 'the GDI+ assembly' }
+        @{ Pattern = 'Show-Command';           What = 'Show-Command' }
+    )
+
+    $files = @(Join-Path $root 'MECMDoctor.ps1') +
+             @('Common.ps1', 'Console.ps1', 'Checks.ps1', 'Repairs.ps1',
+               'Report.ps1', 'LogParser.ps1', 'Bundle.ps1', 'Menu.ps1' |
+               ForEach-Object { Join-Path $root ('lib\' + $_) })
+
+    foreach ($file in $files) {
+        $source = Get-Content -LiteralPath $file -Raw
+        foreach ($b in $banned) {
+            Assert-True ($source -notmatch $b.Pattern) ("{0} depends on {1}" -f (Split-Path -Leaf $file), $b.What)
+        }
+    }
+}
+
+Test-Case 'the one Explorer call checks that Explorer exists first' {
+    # Server Core ships no explorer.exe. Launching it there is not an error to
+    # report, it is a feature that was never installed - and the useful part
+    # (telling the operator the path) has to happen either way.
+    $menu = Get-Content -LiteralPath (Join-Path $root 'lib\Menu.ps1') -Raw
+
+    $calls = @([regex]::Matches($menu, '(?i)explorer\.exe'))
+    Assert-True ($calls.Count -gt 0) 'the Explorer path disappeared - retire this test with it'
+    Assert-True ($menu -match "Test-Path -LiteralPath \`$explorer") 'Open-MDFolder launches Explorer without checking it is there'
+
+    # And it must resolve Explorer under %windir% rather than trusting PATH.
+    Assert-True ($menu -match "Join-Path \`$env:windir 'explorer\.exe'") 'Explorer is resolved from PATH rather than from %windir%'
+}
+
+
+# ===========================================================================
 #  Result
 # ===========================================================================
 Write-Host ''
