@@ -77,7 +77,8 @@ param(
 
     # Repair tier. Safe = reversible; Standard = rebuilds regenerable state;
     # Aggressive = destructive, always confirmed unless -Force.
-    # Left unset, `repair` uses the tier the diagnosis recommends.
+    # Left unset, `repair` uses the tier the diagnosis recommends - which is
+    # capped at Standard, so only naming Aggressive here reaches it.
     [ValidateSet('Safe', 'Standard', 'Aggressive')]
     [string] $Level = 'Standard',
 
@@ -259,10 +260,10 @@ function Show-MDHelp {
     Write-MDSection 'Options'
     Write-MDLine ''
     $options = @(
-        [pscustomobject]@{ Flag = '-Level <tier>';   What = 'Safe | Standard | Aggressive. Default: whatever the diagnosis recommends.' }
+        [pscustomobject]@{ Flag = '-Level <tier>';   What = 'Safe | Standard | Aggressive. Default: what the diagnosis recommends, never Aggressive.' }
         [pscustomobject]@{ Flag = '-DryRun';         What = 'Show what would happen, change nothing. Aliased to -WhatIf.' }
         [pscustomobject]@{ Flag = '-Force';          What = 'Answer yes to every confirmation, including the repair gate. For unattended runs.' }
-        [pscustomobject]@{ Flag = '-Only <ids>';     What = 'Run only these repair actions, ignoring tier and diagnosis.' }
+        [pscustomobject]@{ Flag = '-Only <ids>';     What = 'Run only these repair actions, ignoring tier and diagnosis. Unknown id = error.' }
         [pscustomobject]@{ Flag = '-All';            What = 'Run every repair at the tier except those that require evidence.' }
         [pscustomobject]@{ Flag = '-NoDiagnose';     What = 'Skip the diagnosis pass before repairing.' }
         [pscustomobject]@{ Flag = '-Verify';         What = 'Re-run the diagnosis after repairing.' }
@@ -470,6 +471,7 @@ function Invoke-MDCommand {
 
     $exitCode      = 0
     $blocked       = $false
+    $blockedReason = 'not elevated'
     $findings      = @()
     $repairResults = @()
     $summary       = $null
@@ -491,6 +493,52 @@ function Invoke-MDCommand {
                 Write-MDFail 'Refusing to attempt repairs without administrative rights.'
                 $exitCode = 4
                 $blocked  = $true
+            }
+        }
+
+        # A repair on top of an in-flight ccmsetup produces a half-installed
+        # client: we would stop CcmExec, salvage WMI and reset policy
+        # underneath an installer still writing to all three.
+        #
+        # This is the one gate -Force does not answer. There is no unattended
+        # scenario in which racing the installer is the right call, and the
+        # cost of the alternative is only that the operator waits.
+        if (-not $blocked -and $Command -in @('repair', 'reinstall') -and -not $DryRun) {
+            $inFlight = Get-MDCcmSetupInFlight
+            if ($inFlight.Running) {
+                Write-MDFail 'ccmsetup is running: a client install or upgrade is in flight right now.'
+                Write-MDDetail -Bullet '> ' -Color 'DarkYellow' -Text @(
+                    ('{0} ccmsetup process(es) running{1}.' -f $inFlight.Processes,
+                        $(if ($inFlight.StartedAt) { ', oldest started ' + (Format-MDAge $inFlight.StartedAt) } else { '' }))
+                    'Repairing on top of it stops CcmExec, salvages WMI and resets policy underneath the installer, which reliably leaves a half-installed client behind.'
+                    ('Watch {0}\ccmsetup\Logs\ccmsetup.log until it reports an exit code, then run this again.' -f $env:windir)
+                    'This refusal is deliberately not overridable with -Force. Add -DryRun if you want to see the plan without touching anything.'
+                )
+                $exitCode      = 4
+                $blocked       = $true
+                $blockedReason = 'a client install is already in flight'
+            }
+        }
+
+        # A typo in -Only used to select nothing, plan nothing, and print
+        # "Nothing to repair at this tier" - which reads as "this machine is
+        # fine" and is the most misleading thing the tool could say. Fail on it
+        # instead. Get-MDRepairPlan throws on the same input as a backstop for
+        # every other caller; this exists so the operator sees a sentence
+        # rather than a stack trace.
+        if (-not $blocked -and $Only -and @($Only).Count -gt 0) {
+            $knownIds   = @($script:MDRepairCatalog | ForEach-Object { $_.Id })
+            $unknownIds = @($Only | Where-Object { $knownIds -notcontains $_ })
+
+            if ($unknownIds.Count -gt 0) {
+                Write-MDFail ('Unknown repair action id(s): {0}' -f ($unknownIds -join ', '))
+                Write-MDDetail -Bullet '> ' -Color 'DarkYellow' -Text @(
+                    'Nothing was run. -Only names actions exactly, and an unrecognised name would otherwise select nothing and look like a clean bill of health.'
+                    ('Valid ids: {0}' -f (($knownIds | Sort-Object) -join ', '))
+                )
+                $exitCode      = 4
+                $blocked       = $true
+                $blockedReason = 'unknown -Only action id'
             }
         }
 
@@ -565,6 +613,13 @@ function Invoke-MDCommand {
                     if (-not $levelExplicit -and -not $usingOnly -and $summary -and $summary.Recommended) {
                         $effectiveLevel     = $summary.Recommended
                         $levelFromDiagnosis = $true
+
+                        # Belt and braces on top of the cap in Write-MDSummary.
+                        # A diagnosis never escalates to a destructive tier on
+                        # its own, whatever a summary object happens to say -
+                        # Aggressive is reached only by the operator typing
+                        # -Level or naming an action with -Only.
+                        if ($effectiveLevel -eq 'Aggressive') { $effectiveLevel = 'Standard' }
                     }
 
                     $context = New-MDRepairContext -ClientInfo $clientInfo -Level $effectiveLevel `
@@ -734,7 +789,7 @@ function Invoke-MDCommand {
             }
         }
 
-        $note = if ($blocked) { 'aborted: not elevated' } else {
+        $note = if ($blocked) { 'aborted: ' + $blockedReason } else {
             switch ($exitCode) {
                 0 { 'healthy / completed' }
                 1 { 'completed with warnings' }

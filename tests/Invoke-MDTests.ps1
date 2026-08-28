@@ -119,8 +119,15 @@ Test-Case 'no repair path deletes SMSCFG.INI or the SMS certificate store' {
 }
 
 Test-Case 'an unknown -Only id cannot resurrect it' {
-    $plan = @(Get-MDRepairPlan -Level 'Aggressive' -Only @('client.reregister'))
-    Assert-Equal 0 $plan.Count 'client.reregister still resolves to a plan entry'
+    # It used to be enough that the plan came back empty. Get-MDRepairPlan now
+    # refuses an id it does not know, which is the stronger guarantee: an empty
+    # plan and "Nothing to repair at this tier" reads as a clean bill of
+    # health, and a retired repair id must never produce one.
+    $threw = $false
+    try   { $null = @(Get-MDRepairPlan -Level 'Aggressive' -Only @('client.reregister')) }
+    catch { $threw = $true; Assert-True ("$_" -match 'client\.reregister') 'the error does not name the rejected id' }
+
+    Assert-True $threw 'client.reregister was accepted as a repair action id'
 }
 
 
@@ -177,6 +184,54 @@ Test-Case 'Pass and Info findings never implicate a repair' {
     )
     $plan = @(Get-MDRepairPlan -Level 'Aggressive' -Findings $findings)
     Assert-Equal 0 $plan.Count 'a healthy finding put an action in the plan'
+}
+
+Test-Case 'a diagnosis never recommends the Aggressive tier' {
+    # `repair` with no -Level runs whatever the summary recommends, and -Force
+    # answers every prompt on the way down. If this could return Aggressive,
+    # "mecmdoctor repair -Force" on a machine with a missing CCM\Logs folder
+    # would uninstall and reinstall the client unattended. The tier is reached
+    # by the operator typing it, and by nothing else.
+    foreach ($id in @($script:MDRepairIds.ClientReinstall, $script:MDRepairIds.WmiReset,
+                      $script:MDRepairIds.GpResetState,    $script:MDRepairIds.GpResetSecEdit)) {
+        $r = Write-MDSummary -Findings @(New-TestFinding -RepairIds @($id)) 6>$null
+        Assert-True ($r.Recommended -ne 'Aggressive') ("{0} pushed the recommendation to Aggressive" -f $id)
+        Assert-True ($r.Withheld -contains $id)       ("{0} was not reported as withheld" -f $id)
+    }
+}
+
+Test-Case 'a withheld destructive action is still reported, not hidden' {
+    $findings = @(
+        New-TestFinding -RepairIds @($script:MDRepairIds.CcmRestart)
+        New-TestFinding -RepairIds @($script:MDRepairIds.ClientReinstall)
+    )
+    $r = Write-MDSummary -Findings $findings 6>$null
+
+    Assert-Equal 'Safe' $r.Recommended 'the Safe action should still set the tier'
+    Assert-True ($r.RepairIds -contains $script:MDRepairIds.ClientReinstall) 'the destructive id vanished from the report entirely'
+    Assert-True ($r.Withheld  -contains $script:MDRepairIds.ClientReinstall) 'the destructive id was not listed as withheld'
+}
+
+Test-Case 'the tier the diagnosis recommends can never plan a destructive action' {
+    # The end-to-end version of the two tests above: whatever finding set goes
+    # in, planning at the recommended tier must not produce an Aggressive entry.
+    $everything = @($script:MDRepairCatalog | ForEach-Object { New-TestFinding -RepairIds @($_.Id) })
+    $r    = Write-MDSummary -Findings $everything 6>$null
+    $plan = @(Get-MDRepairPlan -Level $r.Recommended -Findings $everything)
+
+    $destructive = @($plan | Where-Object { $_.Level -eq 'Aggressive' })
+    Assert-Equal 0 $destructive.Count ('the recommended tier planned: ' + (($destructive | ForEach-Object { $_.Id }) -join ', '))
+}
+
+Test-Case 'an unknown -Only id fails loudly instead of planning nothing' {
+    $threw = $false
+    try   { $null = @(Get-MDRepairPlan -Level 'Safe' -Only @('wmi.slavage')) }
+    catch { $threw = $true; Assert-True ("$_" -match 'wmi\.slavage') 'the error does not name the typo' }
+    Assert-True $threw 'a misspelled -Only id produced a silent empty plan'
+
+    # A correctly spelled id must still work, or the check is too strict.
+    $plan = @(Get-MDRepairPlan -Level 'Safe' -Only @($script:MDRepairIds.WmiSalvage))
+    Assert-Equal 1 $plan.Count 'a valid -Only id was rejected'
 }
 
 
@@ -355,6 +410,163 @@ Test-Case 'the live WMI check attaches no reset to the size finding' {
         Assert-Equal 0 @($f.RepairIds).Count 'a live repository size finding carried a repair id'
     }
     Assert-True (@($findings | Where-Object { $_.Title -eq 'WMI corruption assessment' }).Count -eq 1) 'no corruption assessment was produced'
+}
+
+
+# ===========================================================================
+#  4a. -IncludeWarnings asks for detail, not for problems
+# ===========================================================================
+Write-Host ''
+Write-Host '  Log severity roll-up' -ForegroundColor White
+
+function New-TestLogDir {
+    <# A throwaway CCM log directory holding one log with the given lines. #>
+    param([string] $Name, [string[]] $Lines)
+
+    $dir = Join-Path $env:TEMP ('mdlogs-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -Path $dir -ItemType Directory -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $dir $Name) -Value $Lines -Encoding UTF8
+    $dir
+}
+
+function New-TestLogLine {
+    <# One modern-format CCM log line, stamped now so it is inside the window. #>
+    param([string] $Message, [int] $Type, [string] $Component = 'TestComponent')
+
+    $now = Get-Date
+    '<![LOG[{0}]LOG]!><time="{1}.000+000" date="{2}" component="{3}" context="" type="{4}" thread="1234" file="test.cpp:1">' -f
+        $Message, $now.ToString('HH:mm:ss'), $now.ToString('MM-dd-yyyy'), $Component, $Type
+}
+
+Test-Case '-IncludeWarnings does not turn warnings into failures' {
+    # MinType 2 pulls in every Type-2 line the client writes in normal
+    # operation. Rolling those up as a Fail made "mecmdoctor logs
+    # -IncludeWarnings" exit 2 on a healthy client and propose update and
+    # policy resets on the strength of routine chatter.
+    # A recognised code is what gets a Type-2 line surfaced at all - the
+    # parser already drops unrecognised warnings - so this is the exact shape
+    # that used to be rolled up as a failure.
+    $dir = New-TestLogDir -Name 'WUAHandler.log' -Lines @(
+        (New-TestLogLine -Message 'OnSearchComplete - retrying, warning = 0x80244010.' -Type 2)
+        (New-TestLogLine -Message 'Search resumed after transient error 0x80244010.'   -Type 2)
+    )
+    try {
+        $findings = @(Invoke-MDLogReport -LogRoot $dir -Days 7 -MinType 2 6>$null |
+                      Where-Object { $_.Title -eq 'Updates logs' })
+
+        Assert-Equal 1 $findings.Count 'the Updates area produced no finding'
+        Assert-Equal 'Warn' $findings[0].Status 'warning-only logs were reported as a failure'
+        Assert-Equal 0 @($findings[0].RepairIds).Count 'warning-only logs proposed a repair'
+    }
+    finally { Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Test-Case 'a real error in the same logs is still a failure that proposes a repair' {
+    # The other half: the softened roll-up must not have softened the case it
+    # exists for.
+    $dir = New-TestLogDir -Name 'WUAHandler.log' -Lines @(
+        (New-TestLogLine -Message 'OnSearchComplete - retrying, warning = 0x80244010.'              -Type 2)
+        (New-TestLogLine -Message 'OnSearchComplete - Failed to end search job. Error = 0x80244010.' -Type 3)
+    )
+    try {
+        $findings = @(Invoke-MDLogReport -LogRoot $dir -Days 7 -MinType 2 6>$null |
+                      Where-Object { $_.Title -eq 'Updates logs' })
+
+        Assert-Equal 1 $findings.Count 'the Updates area produced no finding'
+        Assert-Equal 'Fail' $findings[0].Status 'a Type-3 error was not reported as a failure'
+        Assert-True (@($findings[0].RepairIds).Count -gt 0) 'a real error proposed no repair'
+    }
+    finally { Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+
+# ===========================================================================
+#  4b. Destruction that has to be earned
+# ===========================================================================
+Write-Host ''
+Write-Host '  Guards on destructive paths' -ForegroundColor White
+
+Test-Case 'an unreadable Registry.pol is never called corrupt' {
+    # Valid is deliberately three-state. $null means "could not verify", and
+    # only $false may ever lead to a file being quarantined - gpsvc holding
+    # the file open mid-write must not cost a machine its applied policy.
+    $locked = Join-Path $env:TEMP ('mdpol-' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.pol')
+    [System.IO.File]::WriteAllBytes($locked, ([byte[]](0x50, 0x52, 0x65, 0x67, 1, 0, 0, 0)))
+
+    # Opened exclusively: nothing else may read it while this handle is held.
+    $hold = New-Object System.IO.FileStream($locked,
+                [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+    try {
+        $verdict = Test-MDRegistryPolIntegrity -Path $locked
+        Assert-True ($verdict.Valid -ne $false) 'an unreadable Registry.pol was reported as corrupt'
+        Assert-True ($null -eq $verdict.Valid)  'an unreadable Registry.pol did not return the unverified verdict'
+    }
+    finally {
+        $hold.Dispose()
+        Remove-Item -LiteralPath $locked -Force -ErrorAction SilentlyContinue
+    }
+}
+
+Test-Case 'a valid Registry.pol reads as valid through a writer' {
+    # The other half: FileShare::ReadWrite means a file someone else has open
+    # for writing still verifies, rather than being condemned for it.
+    $shared = Join-Path $env:TEMP ('mdpol-' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.pol')
+    [System.IO.File]::WriteAllBytes($shared, ([byte[]](0x50, 0x52, 0x65, 0x67, 1, 0, 0, 0)))
+
+    $hold = New-Object System.IO.FileStream($shared,
+                [System.IO.FileMode]::Open, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
+    try {
+        $verdict = Test-MDRegistryPolIntegrity -Path $shared
+        Assert-Equal $true $verdict.Valid 'a valid Registry.pol held open for writing did not verify'
+    }
+    finally {
+        $hold.Dispose()
+        Remove-Item -LiteralPath $shared -Force -ErrorAction SilentlyContinue
+    }
+
+    # And a genuinely corrupt header still has to come back $false, or the
+    # three-state verdict has quietly turned into "never repair anything".
+    $bad = Join-Path $env:TEMP ('mdpol-' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.pol')
+    [System.IO.File]::WriteAllBytes($bad, ([byte[]](0x4E, 0x4F, 0x50, 0x45, 9, 9, 9, 9)))
+    try {
+        Assert-Equal $false (Test-MDRegistryPolIntegrity -Path $bad).Valid 'a corrupt Registry.pol was not reported as corrupt'
+    }
+    finally { Remove-Item -LiteralPath $bad -Force -ErrorAction SilentlyContinue }
+}
+
+Test-Case 'the cache sweep refuses a path that is not a cache' {
+    foreach ($bad in @('', 'C:\', $env:SystemDrive, $env:windir, $env:ProgramData, 'D:\Data', 'C:\Users')) {
+        $verdict = Test-MDCachePathSane -Path $bad
+        Assert-True (-not $verdict.Sane) ("recursive delete would have been allowed on '{0}'" -f $bad)
+    }
+
+    # The real thing still has to pass, or the guard has disabled the repair.
+    foreach ($good in @((Join-Path $env:windir 'ccmcache'), 'D:\SCCMCache', 'C:\Windows\CCM\Cache')) {
+        $verdict = Test-MDCachePathSane -Path $good
+        Assert-True $verdict.Sane ("a real cache path was refused: {0} - {1}" -f $good, $verdict.Reason)
+    }
+}
+
+Test-Case 'a repair cannot run while ccmsetup is in flight' {
+    # The gate itself lives in Invoke-MDCommand, which needs a whole run to
+    # exercise. What is asserted here is that it exists, is wired to the two
+    # commands that change things, and is not answerable by -Force.
+    $entry = Get-Content -LiteralPath (Join-Path $root 'MECMDoctor.ps1') -Raw
+    Assert-True ($entry -match 'Get-MDCcmSetupInFlight') 'nothing in the entry script consults the ccmsetup gate'
+    Assert-True ($entry -match "Command -in @\('repair', 'reinstall'\) -and -not \`$DryRun") 'the ccmsetup gate is not scoped to the commands that change things'
+
+    # -Force must not appear in either of the gate's two conditions. Asserted
+    # on the conditions alone: the block's own prose says the word "-Force"
+    # while explaining that it does not honour it.
+    foreach ($line in @($entry -split "`n")) {
+        if ($line -match '^\s*if \(.*(blocked -and \$Command -in|inFlight\.Running)') {
+            Assert-True (-not ($line -match '\$Force')) ('the ccmsetup gate consults -Force: ' + $line.Trim())
+        }
+    }
+
+    # And the helper answers on a machine with no installer running.
+    $state = Get-MDCcmSetupInFlight
+    Assert-True ($state.Running -is [bool]) 'the in-flight helper did not report a boolean'
 }
 
 

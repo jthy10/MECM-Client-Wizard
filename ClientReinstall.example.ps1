@@ -26,6 +26,12 @@
      CONTRACT
        - exit code 0        => success
        - any other exit code => mecmdoctor reports the reinstall as failed
+       - END YOUR SCRIPT WITH AN EXPLICIT "exit 0". $LASTEXITCODE is
+         session-wide and sticky: a script that simply falls off the end
+         leaves whatever the last native command set, and a perfectly
+         successful reinstall can then be reported as a failure. mecmdoctor
+         clears $LASTEXITCODE before invoking you, but a native command run
+         inside your own script will set it again.
        - everything written to the output stream is captured into the
          mecmdoctor transcript, so Write-Output/Write-Host freely
 
@@ -148,6 +154,27 @@ else {
 # broken: these are the leftovers that most often break the fresh install too.
 Write-Step 'Removing leftover client state'
 
+# Copy the logs out first. The two folders below hold ccmsetup.log and the
+# client's own CCM\Logs, which are exactly the files every failure message in
+# this script tells the operator to go and read - and the recursive delete
+# further down would take both with them, leaving nothing to debug.
+$logStash = Join-Path $env:TEMP ('ccmsetup-logs-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+$stashed  = $false
+foreach ($src in @((Join-Path $env:windir 'CCMSetup\Logs'), (Join-Path $env:windir 'CCM\Logs'))) {
+    if (Test-Path -LiteralPath $src) {
+        try {
+            $dest = Join-Path $logStash (Split-Path -Parent $src | Split-Path -Leaf)
+            New-Item -Path $dest -ItemType Directory -Force -ErrorAction Stop | Out-Null
+            Copy-Item -LiteralPath $src -Destination $dest -Recurse -Force -ErrorAction Stop
+            $stashed = $true
+        }
+        catch {
+            Write-Step ("  could not preserve {0} - {1}" -f $src, $_.Exception.Message)
+        }
+    }
+}
+if ($stashed) { Write-Step ("  previous client logs preserved at {0}" -f $logStash) }
+
 $leftovers = @(
     (Join-Path $env:windir 'CCM')
     (Join-Path $env:windir 'CCMSetup')
@@ -204,7 +231,7 @@ while ((Get-Date) -lt $deadline) {
 
 if (Get-Process -Name 'ccmsetup' -ErrorAction SilentlyContinue) {
     Write-Step 'FAILED: ccmsetup is still running past the timeout.'
-    Write-Step 'Check C:\Windows\ccmsetup\Logs\ccmsetup.log for what it is stuck on.'
+    Write-Step ("Check {0}\ccmsetup\Logs\ccmsetup.log for what it is stuck on." -f $env:windir)
     exit 1
 }
 
@@ -219,7 +246,7 @@ catch { }
 
 if ($null -ne $lastExit -and $lastExit -ne 0) {
     Write-Step ("FAILED: ccmsetup reported exit code {0}" -f $lastExit)
-    Write-Step 'See C:\Windows\ccmsetup\Logs\ccmsetup.log for the failing step.'
+    Write-Step ("See {0}\ccmsetup\Logs\ccmsetup.log for the failing step." -f $env:windir)
     exit $lastExit
 }
 

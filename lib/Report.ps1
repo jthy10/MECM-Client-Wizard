@@ -38,8 +38,7 @@ function Write-MDSummary {
         so the caller can set an exit code from it.
 #>
     param(
-        [Parameter(Mandatory)] $Findings,
-        [string] $Level = 'Standard'
+        [Parameter(Mandatory)] $Findings
     )
 
     $all = @($Findings)
@@ -108,18 +107,40 @@ function Write-MDSummary {
     $repairIds = @($repairIds | Where-Object { $_ } | Select-Object -Unique)
 
     $recommended = $null
+    $withheldIds = @()
+    $plannedIds  = @($repairIds)
+
     if ($repairIds.Count -gt 0) {
         # Recommend the lowest tier that actually covers what was found, so we
         # never talk someone into a destructive repair they do not need.
+        # Destructive actions are set aside rather than counted, so that one of
+        # them cannot drag the recommended tier up for actions that do not need
+        # it. A missing log directory implicating client.reinstall should still
+        # recommend "Safe" for the ccmexec restart sitting next to it.
         $levelsNeeded = @()
         foreach ($id in $repairIds) {
             $entry = $script:MDRepairCatalog | Where-Object { $_.Id -eq $id } | Select-Object -First 1
-            if ($entry) { $levelsNeeded += $entry.Level }
+            if (-not $entry) { continue }
+
+            if ($entry.Level -eq 'Aggressive') { $withheldIds  += $entry.Id }
+            else                               { $levelsNeeded += $entry.Level }
         }
 
+        # The cap at Standard is the safety property of this whole function.
+        # `repair` with no -Level runs whatever is recommended here, and -Force
+        # answers every prompt on the way down - so if this were allowed to
+        # return Aggressive, "mecmdoctor repair -Force" on a machine with a
+        # missing CCM\Logs folder would uninstall and reinstall the client,
+        # unattended, off the back of one modest finding.
+        #
+        # A destructive tier is reached only when the operator types
+        # -Level Aggressive, or names the action outright with -Only. Nothing
+        # a report concludes on its own is sufficient reason.
         $recommended = 'Safe'
-        if ($levelsNeeded -contains 'Standard')   { $recommended = 'Standard' }
-        if ($levelsNeeded -contains 'Aggressive') { $recommended = 'Aggressive' }
+        if ($levelsNeeded -contains 'Standard') { $recommended = 'Standard' }
+
+        $withheldIds = @($withheldIds | Select-Object -Unique)
+        $plannedIds  = @($repairIds | Where-Object { $withheldIds -notcontains $_ })
     }
 
     # A machine with no client at all is a reinstall job, not a repair job.
@@ -141,15 +162,29 @@ function Write-MDSummary {
     elseif (-not $recommended) {
         Write-MDLine '  Nothing to repair.' -Color 'Green'
     }
+    elseif ($plannedIds.Count -eq 0) {
+        # Everything the diagnosis implicated is destructive. There is nothing
+        # to recommend here, only something to offer - and offering it is the
+        # operator's decision to make, not the report's.
+        Write-MDLine '  mecmdoctor repair -Level Aggressive -DryRun' -Color 'Cyan'
+        Write-MDLine ''
+        Write-MDDetail -Text ('The only repair action(s) this diagnosis implicated are destructive: {0}' -f ($withheldIds -join ', ')) -Indent 4 -Color 'DarkYellow'
+        Write-MDDetail -Text 'mecmdoctor never escalates to a destructive tier on its own, so a plain "mecmdoctor repair" will find nothing to do here.' -Indent 4
+        Write-MDDetail -Text 'Start with -DryRun above to see exactly what each one would do. Drop -DryRun only once you have read it and agree.' -Indent 4
+    }
     else {
         Write-MDLine '  mecmdoctor repair' -Color 'Cyan'
         Write-MDLine ''
         Write-MDDetail -Text ('The diagnosis recommends the {0} tier, which is what repair uses unless you pass -Level yourself.' -f $recommended) -Indent 4
-        Write-MDDetail -Text ('It would run {0} targeted repair action(s): {1}' -f $repairIds.Count, ($repairIds -join ', ')) -Indent 4
+        Write-MDDetail -Text ('It would run {0} targeted repair action(s): {1}' -f $plannedIds.Count, ($plannedIds -join ', ')) -Indent 4
         Write-MDDetail -Text 'repair explains why each action is in the plan and asks before it changes anything.' -Indent 4
         Write-MDDetail -Text 'Add -DryRun to see exactly what would happen without changing anything.' -Indent 4
-        if ($recommended -eq 'Aggressive') {
-            Write-MDDetail -Text 'This plan includes destructive actions. Each one warns and asks for its own confirmation before running. Add -Force only in an unattended run you have already validated.' -Indent 4 -Color 'DarkYellow'
+
+        if ($withheldIds.Count -gt 0) {
+            Write-MDLine ''
+            Write-MDDetail -Text ('The diagnosis also implicated {0} destructive action(s): {1}' -f $withheldIds.Count, ($withheldIds -join ', ')) -Indent 4 -Color 'DarkYellow'
+            Write-MDDetail -Text 'They are deliberately left out of the recommendation above. A destructive repair is not something to run because a report suggested it.' -Indent 4 -Color 'DarkYellow'
+            Write-MDDetail -Text 'To consider them, ask for them by name: mecmdoctor repair -Level Aggressive -DryRun. Each one still explains what it costs and asks for its own confirmation.' -Indent 4 -Color 'DarkYellow'
         }
     }
 
@@ -162,6 +197,11 @@ function Write-MDSummary {
         Issues      = $issues.Count
         RepairIds   = $repairIds
         Recommended = $recommended
+
+        # The destructive ids the diagnosis implicated but deliberately did not
+        # recommend. Exposed so a caller (and the test suite) can see that the
+        # cap above happened, rather than having to infer it from a tier name.
+        Withheld    = $withheldIds
     }
 }
 
@@ -395,7 +435,21 @@ function Export-MDReport {
             New-Item -Path $dir -ItemType Directory -Force -ErrorAction Stop | Out-Null
         }
 
-        $report | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $Path -Encoding UTF8 -ErrorAction Stop
+        # .NET resolves a relative path against the process working directory,
+        # which is not PowerShell's current location. -Json out.json would
+        # otherwise land somewhere the operator did not ask for.
+        $fullPath = $Path
+        if (-not [System.IO.Path]::IsPathRooted($fullPath)) {
+            $fullPath = Join-Path (Get-Location -PSProvider FileSystem).ProviderPath $Path
+        }
+
+        # UTF-8 with no BOM, written directly rather than through Set-Content:
+        # -Encoding UTF8 on PS 5.1 emits a byte-order mark, and this file is
+        # explicitly meant to be eaten by a database, a Log Analytics
+        # workspace or a Configuration Item. Python's json.load, several Go
+        # parsers and a number of ingestion pipelines all reject a leading BOM.
+        $json = $report | ConvertTo-Json -Depth 8
+        [System.IO.File]::WriteAllText($fullPath, $json, (New-Object System.Text.UTF8Encoding($false)))
         Write-MDOk ("Report written to {0}" -f $Path)
         return $true
     }

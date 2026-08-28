@@ -321,6 +321,29 @@ Every tier includes the ones below it.
 The default is **no**, so a bare Enter cancels and nothing is changed. Pass `-Level` yourself to
 override the recommendation, and `-Force` to answer yes for unattended runs.
 
+**A diagnosis never recommends the Aggressive tier.** The recommendation is capped at `Standard`,
+so `mecmdoctor repair -Force` cannot escalate into a destructive action however bad the findings
+are. When the diagnosis does implicate one, it says so and names it, and stops there:
+
+```
+    The diagnosis also implicated 1 destructive action(s): client.reinstall
+    They are deliberately left out of the recommendation above. A destructive repair is not
+    something to run because a report suggested it.
+    To consider them, ask for them by name: mecmdoctor repair -Level Aggressive -DryRun
+```
+
+Aggressive is reached by typing `-Level Aggressive`, or by naming the action with `-Only`. Nothing
+else gets you there.
+
+**`repair` and `reinstall` refuse to run while `ccmsetup` is running.** Repairing on top of an
+in-flight install or upgrade stops `CcmExec`, salvages WMI and resets policy underneath the
+installer, which reliably leaves a half-installed client behind. This refusal is not overridable
+with `-Force`; wait for the install to finish, or use `-DryRun` to see the plan meanwhile.
+
+**A misspelled `-Only` id is an error, not an empty plan.** `mecmdoctor repair -Only wmi.slavage`
+exits `4` and lists the valid ids, rather than planning nothing and reporting that there was
+nothing to do.
+
 Useful flags:
 
 ```powershell
@@ -469,21 +492,25 @@ These make it straightforward to run as a Configuration Manager script, a Config
 scheduled task, and act on the result. For unattended use, remember that `repair` will not proceed
 past its confirmation gate without `-Force`.
 
+`mecmdoctor.bat` returns the exit code of the run it launched, including when it has to elevate
+first — it waits for the elevated copy and passes the code back. If elevation itself is declined or
+fails, it returns `4`.
+
 ---
 
 ## Options
 
 | Option | Meaning |
 |---|---|
-| `-Level <tier>` | `Safe` \| `Standard` \| `Aggressive`. Default: whatever the diagnosis recommends. |
+| `-Level <tier>` | `Safe` \| `Standard` \| `Aggressive`. Default: whatever the diagnosis recommends, which is never `Aggressive`. |
 | `-DryRun` | Show what would happen and change nothing. Aliased to `-WhatIf`. |
-| `-Force` | Answer yes to every confirmation, including the repair gate. Required for unattended runs. |
-| `-Only <ids>` | Run only these repair actions, ignoring tier and diagnosis. |
+| `-Force` | Answer yes to every confirmation, including the repair gate. Required for unattended runs. Does not raise the tier, and does not override the `ccmsetup`-in-flight refusal. |
+| `-Only <ids>` | Run only these repair actions, ignoring tier and diagnosis. An unrecognised id is an error. |
 | `-All` | Run every repair at the tier except those that require evidence (`wmi.reset`). |
 | `-NoDiagnose` | Skip the diagnosis pass before repairing. |
 | `-Verify` | Re-run the diagnosis after repairing. |
 | `-Days <n>` | How many days of CCM logs to scan. Default `7`. |
-| `-IncludeWarnings` | Report log warnings as well as errors. |
+| `-IncludeWarnings` | Report log warnings as well as errors. Warnings are reported as warnings: they never become failures and never propose a repair. |
 | `-SkipLogs` | Skip log parsing; also leaves the CCM logs out of a bundle. Much faster. |
 | `-Json <path>` | Also write a machine-readable JSON report. |
 | `-BundlePath <path>` | Where `bundle` writes its ZIP: a folder, or a full path ending in `.zip`. |

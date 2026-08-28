@@ -34,6 +34,7 @@ set "SCRIPT_DIR=%~dp0"
 set "PS1=%SCRIPT_DIR%MECMDoctor.ps1"
 set "PAUSEATEND="
 set "FIRSTARG="
+set "ALREADYELEVATED="
 
 rem --- locate the PowerShell script -------------------------------------------
 if not exist "%PS1%" (
@@ -55,6 +56,7 @@ set "ARGS="
 if "%~1"=="" goto args_done
 if /i "%~1"=="--elevated" (
     set "PAUSEATEND=1"
+    set "ALREADYELEVATED=1"
     shift
     goto parse_args
 )
@@ -103,8 +105,19 @@ exit /b 4
 :elevation_check
 
 rem --- elevation check ---------------------------------------------------------
-rem  "net session" fails against a non-elevated token. It is the most portable
-rem  admin test that does not require PowerShell to already be running.
+rem  The --elevated marker is authoritative and is checked first. Without that,
+rem  a failing admin test on an already-elevated copy would relaunch itself,
+rem  fail the same test, and relaunch again - a UAC prompt on a loop with no
+rem  way out. The marker is only ever set by the relaunch below.
+if defined ALREADYELEVATED goto run_script
+
+rem  "fltmc" is the admin test rather than "net session": net session needs the
+rem  Server service (LanmanServer), which hardened workstation baselines often
+rem  stop or disable outright, and it then reports a perfectly elevated shell
+rem  as unprivileged. fltmc depends on no service at all. net session stays as
+rem  a fallback for the rare image where fltmc is absent.
+fltmc >nul 2>&1
+if not errorlevel 1 goto run_script
 net session >nul 2>&1
 if not errorlevel 1 goto run_script
 
@@ -112,26 +125,41 @@ echo.
 echo   [ ^>^> ] Administrative rights are required. Requesting elevation...
 echo.
 
-rem  Escape any double quotes in the argument list so that they survive the trip
-rem  through cmd and into the PowerShell -Command string.
+rem  Escape the argument list for the trip through cmd and into the PowerShell
+rem  -Command string:
+rem    "  ->  \"   so the quote survives cmd's own parsing
+rem    '  ->  ''   because the list is embedded in a single-quoted PS string,
+rem                and a path like C:\Temp\O'Brien\out.json would end it early
+rem  A literal ! in an argument is consumed by delayed expansion when ARGS is
+rem  built above and cannot be recovered here; pass a path without one, or call
+rem  MECMDoctor.ps1 directly.
 set "ESCARGS=!ARGS!"
 if defined ESCARGS set "ESCARGS=!ESCARGS:"=\"!"
+if defined ESCARGS set "ESCARGS=!ESCARGS:'=''!"
 
 rem  -WorkingDirectory keeps the elevated copy in this folder. Without it the
 rem  elevated process starts in system32, which would change where a
 rem  ClientReinstall.ps1 in the current directory is looked for.
-powershell -NoProfile -NoLogo -ExecutionPolicy Bypass -Command "Start-Process -FilePath '!SELF!' -ArgumentList '--elevated!ESCARGS!' -WorkingDirectory '%SCRIPT_DIR%' -Verb RunAs"
-if errorlevel 1 (
+rem
+rem  -Wait -PassThru so this instance can hand back the elevated run's exit
+rem  code. Without it every documented exit code - the ones an MECM script
+rem  deployment, a Configuration Item or a scheduled task actually read - would
+rem  be 0 regardless of what the run concluded. 199 is an out-of-band sentinel
+rem  for "the elevation itself failed", which mecmdoctor never returns.
+powershell -NoProfile -NoLogo -ExecutionPolicy Bypass -Command "try { $p = Start-Process -FilePath '!SELF!' -ArgumentList '--elevated!ESCARGS!' -WorkingDirectory '%SCRIPT_DIR%' -Verb RunAs -PassThru -Wait -ErrorAction Stop; exit $p.ExitCode } catch { exit 199 }"
+set "RC=%ERRORLEVEL%"
+
+if "!RC!"=="199" (
     echo.
     echo   [FAIL] Elevation was declined or failed.
     echo          Open an administrative command prompt and run this again.
     echo.
     if defined PAUSEATEND pause
-    exit /b 4
+    endlocal & exit /b 4
 )
 
-rem  The elevated copy owns the run from here; this instance is finished.
-exit /b 0
+rem  The elevated copy did the run; its exit code is the one that matters.
+endlocal & exit /b %RC%
 
 rem --- run ----------------------------------------------------------------------
 :run_script

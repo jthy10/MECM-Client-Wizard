@@ -163,6 +163,10 @@ function ConvertFrom-MDLogText {
             -LogName  $LogName))
     }
 
+    # A file holding both formats loses its legacy lines here. In practice a
+    # CCM log is written by one component in one format for its whole life, so
+    # this is a deliberate simplification rather than an oversight - but it is
+    # the reason to look here first if a mixed log ever turns up short.
     if ($entries.Count -gt 0) { return $entries }
 
     # --- legacy format ------------------------------------------------------
@@ -179,9 +183,15 @@ function ConvertFrom-MDLogText {
             $t = $Matches['t']
         }
         # The legacy header has no severity field; infer it from the wording.
+        # The exclusion list is the price of inferring: "no errors found",
+        # "completed without error", "Failover" and "failsafe" all match the
+        # naive patterns and are all reporting success.
+        $msgText = $m.Groups['msg'].Value
+        $benign  = ($msgText -match '(?i)\bno\s+error|without\s+error|\berror(s)?\s*[:=]?\s*0\b|\bfailover\b|\bfail-?safe\b')
+
         $type = 1
-        if ($m.Groups['msg'].Value -match '(?i)\bwarn') { $type = 2 }
-        if ($m.Groups['msg'].Value -match '(?i)(\berror\b|\bfail)') { $type = 3 }
+        if (-not $benign -and $msgText -match '(?i)\bwarn')                 { $type = 2 }
+        if (-not $benign -and $msgText -match '(?i)(\berror\b|\bfail)')     { $type = 3 }
 
         $entries.Add((New-MDLogEntry `
             -Message  $m.Groups['msg'].Value `
@@ -388,6 +398,13 @@ function Get-MDLogIssues {
                 if ($buckets.ContainsKey($key)) {
                     $b = $buckets[$key]
                     $b.Count++
+
+                    # A bucket represents every line that collapsed into it, so
+                    # it carries the worst severity any of them had. Keeping the
+                    # first line's type meant one warning arriving before an
+                    # error with the same code downgraded the whole bucket, and
+                    # the error stopped counting as one.
+                    if ($entry.Type -gt $b.Type) { $b.Type = $entry.Type }
                     if ($entry.Time -and (-not $b.LastSeen -or $entry.Time -gt $b.LastSeen))  { $b.LastSeen  = $entry.Time; $b.Message = $entry.Message }
                     if ($entry.Time -and (-not $b.FirstSeen -or $entry.Time -lt $b.FirstSeen)) { $b.FirstSeen = $entry.Time }
                 }
@@ -512,10 +529,22 @@ function Invoke-MDLogReport {
 
         $issues | Write-MDLogIssue
 
+        # -IncludeWarnings lowers MinType to 2, which pulls in every Type-2
+        # line the client writes in normal operation. Those are warnings, and
+        # rolling them up as a Fail would make "mecmdoctor logs
+        # -IncludeWarnings" on a healthy client exit 2 and propose resets -
+        # turning a switch that asks for more detail into one that invents
+        # problems. Write-MDLogIssue already draws this line per issue; the
+        # roll-up has to draw it the same way.
+        $errors    = @($issues | Where-Object { $_.Type -ge 3 })
+        $hasErrors = ($errors.Count -gt 0)
+
         # Roll the log evidence up into one finding per area, carrying the
-        # repair suggestions implied by the codes we recognised.
+        # repair suggestions implied by the codes we recognised. Driven off the
+        # errors alone: a warning is worth printing, not worth resetting the
+        # update store over.
         $repairIds = @()
-        foreach ($i in $issues) {
+        foreach ($i in $errors) {
             switch ($i.LogArea) {
                 'Registration' { $repairIds += $script:MDRepairIds.CcmRestart;   $repairIds += $script:MDRepairIds.PolicyTrigger }
                 'Policy'       { $repairIds += $script:MDRepairIds.PolicyReset }
@@ -526,17 +555,30 @@ function Invoke-MDLogReport {
             }
         }
 
-        $evidence = foreach ($i in ($issues | Select-Object -First 4)) {
+        # Show the errors when there are errors: a Fail whose evidence is four
+        # warnings does not explain itself.
+        $evidenceSource = if ($hasErrors) { $errors } else { $issues }
+
+        $evidence = foreach ($i in ($evidenceSource | Select-Object -First 4)) {
             $code = ''
             if ($i.Error) { $code = $i.Error.Code + ' ' }
             '{0}: {1}{2}' -f $i.LogName, $code, ($i.Message.Substring(0, [Math]::Min(120, $i.Message.Length)))
         }
 
-        $findings.Add((New-MDFinding -Category 'Logs' -Title ("$area logs") -Status 'Fail' `
-            -Detail ("{0} distinct error(s) in the last {1} day(s)" -f $issues.Count, $Days) `
+        $status = if ($hasErrors) { 'Fail' } else { 'Warn' }
+        $detail = if ($hasErrors) {
+            "{0} distinct error(s) in the last {1} day(s)" -f $errors.Count, $Days
+        } else {
+            "{0} warning(s) in the last {1} day(s), no errors" -f $issues.Count, $Days
+        }
+
+        $areaRepairIds = @($repairIds | Select-Object -Unique)
+
+        $findings.Add((New-MDFinding -Category 'Logs' -Title ("$area logs") -Status $status `
+            -Detail $detail `
             -Evidence $evidence `
-            -Remediation (($issues | Where-Object { $_.Error } | Select-Object -First 1).Error.Fix) `
-            -RepairIds ($repairIds | Select-Object -Unique))) | Out-Null
+            -Remediation (($evidenceSource | Where-Object { $_.Error } | Select-Object -First 1).Error.Fix) `
+            -RepairIds $areaRepairIds)) | Out-Null
     }
 
     $findings

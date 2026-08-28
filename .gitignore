@@ -8,8 +8,13 @@ ClientReinstall.ps1
 *.cmtrace.log
 Logs/
 Backups/
-*.json
-!.vscode/*.json
+
+# Only the reports this tool writes, not every .json in the tree. A bare
+# *.json would silently swallow a config file added later, and the resulting
+# "why is my setting being ignored" is a bad afternoon.
+diagnosis.json
+*.report.json
+mecmdoctor-*.json
 
 # Windows / editor noise
 Thumbs.db

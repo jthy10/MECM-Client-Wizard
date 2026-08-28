@@ -518,8 +518,19 @@ function Repair-MDCacheClear {
     # --- orphan sweep -------------------------------------------------------
     # Folders left behind after a failed download are never reclaimed by the
     # client itself, and are a common cause of a cache drive filling up.
+    #
+    # This is a recursive delete of a path handed to us by the same WMI we are
+    # here to diagnose, so it is checked before it is trusted. Nothing else in
+    # this repair depends on the sweep: the tracked-element deletion above has
+    # already done the reversible part of the job.
     $cacheRoot = $Context.ClientInfo.CacheLocation
-    if ($cacheRoot -and (Test-Path -LiteralPath $cacheRoot)) {
+    $sanity    = Test-MDCachePathSane -Path $cacheRoot
+
+    if (-not $sanity.Sane) {
+        $evidence += ('leftover-folder sweep skipped: {0}' -f $sanity.Reason)
+        $evidence += 'Nothing on disk was deleted. If that path really is this client''s cache, clear it by hand after checking it.'
+    }
+    elseif ($cacheRoot -and (Test-Path -LiteralPath $cacheRoot)) {
         $orphans = @(Get-ChildItem -LiteralPath $cacheRoot -Directory -Force -ErrorAction SilentlyContinue)
         $orphanRemoved = 0
 
@@ -541,7 +552,10 @@ function Repair-MDCacheClear {
     }
 
     if ($removed -eq 0 -and $freed -eq 0) {
-        return New-MDRepairResult -Id $id -Name 'Clear the client content cache' -Status 'NotNeeded' -Detail 'the cache was already empty' -Evidence $evidence
+        # "Already empty" is only true if we were actually allowed to look.
+        $detail = if ($sanity.Sane) { 'the cache was already empty' }
+                  else              { 'no tracked cache content, and the folder sweep was refused' }
+        return New-MDRepairResult -Id $id -Name 'Clear the client content cache' -Status 'NotNeeded' -Detail $detail -Evidence $evidence
     }
 
     New-MDRepairResult -Id $id -Name 'Clear the client content cache' -Status 'Success' `
@@ -731,7 +745,11 @@ function Repair-MDWmiSalvage {
         $verifyText = ($verify.StdOut + $verify.StdErr).Trim()
         $evidence += ('verifyrepository exit {0}: {1}' -f $verify.ExitCode, $verifyText)
 
-        $consistent = ($verify.ExitCode -eq 0 -and $verifyText -match '(?i)consistent')
+        # Exit code only. winmgmt prints its verdict in the machine's display
+        # language, so also requiring the English word "consistent" would
+        # report a successful salvage on a German or French install as a
+        # failure. The text is already in $evidence.
+        $consistent = ($verify.ExitCode -eq 0)
 
         if ($consistent) {
             return New-MDRepairResult -Id $id -Name 'Salvage the WMI repository' -Status 'Success' `
@@ -810,7 +828,7 @@ function Repair-MDClientRepair {
         return New-MDRepairResult -Id $id -Name 'Repair the Configuration Manager client' -Status 'Success' `
             -Detail 'client repair started' `
             -Evidence @('ccmrepair.exe runs in the background and can take 10-20 minutes.',
-                        'Follow progress in C:\Windows\ccmsetup\Logs\ccmsetup.log.')
+                        ('Follow progress in {0}\ccmsetup\Logs\ccmsetup.log.' -f $env:windir))
     }
 
     # WMI is often the thing that is broken, so fall back to the executable.
@@ -821,7 +839,7 @@ function Repair-MDClientRepair {
             Start-Process -FilePath $ccmRepair -ErrorAction Stop
             return New-MDRepairResult -Id $id -Name 'Repair the Configuration Manager client' -Status 'Success' `
                 -Detail 'ccmrepair.exe launched' `
-                -Evidence @('Follow progress in C:\Windows\ccmsetup\Logs\ccmsetup.log.')
+                -Evidence @(('Follow progress in {0}\ccmsetup\Logs\ccmsetup.log.' -f $env:windir))
         }
         catch {
             return New-MDRepairResult -Id $id -Name 'Repair the Configuration Manager client' -Status 'Failed' `
@@ -947,30 +965,51 @@ function Repair-MDGroupPolicyPol {
         }
     }
 
-    # Only touch files that actually fail validation. A healthy Registry.pol
-    # holds real configuration and must not be thrown away.
-    $bad = @()
+    # Only touch files PROVEN corrupt. A healthy Registry.pol holds real
+    # configuration and must not be thrown away - and "I could not read it" is
+    # not a finding about its contents. Test-MDRegistryPolIntegrity returns
+    # $null for that case precisely so this test can stay explicit: a sharing
+    # violation from gpsvc, or an ACL problem, must never reach $bad.
+    $bad          = @()
+    $unverifiable = @()
     foreach ($c in $candidates) {
         if (-not (Test-Path -LiteralPath $c.Path)) { continue }
         $verdict = Test-MDRegistryPolIntegrity -Path $c.Path
-        if (-not $verdict.Valid) { $bad += [pscustomobject]@{ Path = $c.Path; Scope = $c.Scope; Reason = $verdict.Reason } }
+
+        if ($verdict.Valid -eq $false) {
+            $bad += [pscustomobject]@{ Path = $c.Path; Scope = $c.Scope; Reason = $verdict.Reason }
+        }
+        elseif ($null -eq $verdict.Valid) {
+            $unverifiable += [pscustomobject]@{ Path = $c.Path; Scope = $c.Scope; Reason = $verdict.Reason }
+        }
     }
 
     # A zero-byte gpt.ini causes the same class of failure.
     $gptIni = Join-Path $env:windir 'System32\GroupPolicy\gpt.ini'
     $badGpt = (Test-Path -LiteralPath $gptIni) -and ((Get-Item -LiteralPath $gptIni).Length -eq 0)
 
+    # Reported on every exit path below, never acted on. A file we could not
+    # read is exactly the file we must not delete, but staying silent about it
+    # would hide the one case where an operator does need to look.
+    $unverifiableText = @($unverifiable | ForEach-Object {
+        'NOT VERIFIED, left untouched: {0} ({1}) - {2}' -f $_.Path, $_.Scope, $_.Reason
+    })
+
     if ($bad.Count -eq 0 -and -not $badGpt) {
+        $detail = 'all local policy files pass validation'
+        if ($unverifiable.Count -gt 0) {
+            $detail = ('no corrupt file found; {0} file(s) could not be read and were left alone' -f $unverifiable.Count)
+        }
         return New-MDRepairResult -Id $id -Name 'Repair corrupt local Group Policy files' -Status 'NotNeeded' `
-            -Detail 'all local policy files pass validation'
+            -Detail $detail -Evidence $unverifiableText
     }
     if ($Context.DryRun) {
         return New-MDRepairResult -Id $id -Name 'Repair corrupt local Group Policy files' -Status 'DryRun' `
             -Detail ('would quarantine {0} file(s) and run gpupdate /force' -f ($bad.Count + [int]$badGpt)) `
-            -Evidence (@($bad | ForEach-Object { '{0} ({1}): {2}' -f $_.Path, $_.Scope, $_.Reason }))
+            -Evidence (@($bad | ForEach-Object { '{0} ({1}): {2}' -f $_.Path, $_.Scope, $_.Reason }) + $unverifiableText)
     }
 
-    $evidence = @()
+    $evidence = @() + $unverifiableText
 
     foreach ($b in $bad) {
         $backup = Save-MDBackupCopy -Context $Context -Path $b.Path -SubFolder 'grouppolicy'
@@ -999,7 +1038,10 @@ function Repair-MDGroupPolicyPol {
     $gp = Invoke-MDProcess -FilePath (Join-Path $env:windir 'System32\gpupdate.exe') -ArgumentList @('/force') -TimeoutSeconds 300
     $evidence += ('gpupdate /force exit {0}' -f $gp.ExitCode)
 
-    $failed = @($evidence | Where-Object { $_ -match 'could not' })
+    # Anchored on the removal failures written above rather than on any line
+    # containing "could not" - the NOT VERIFIED notes say that too, and they
+    # are a deliberate outcome of this repair rather than a failure of it.
+    $failed = @($evidence | Where-Object { $_ -match '^could not remove' })
     New-MDRepairResult -Id $id -Name 'Repair corrupt local Group Policy files' -Status $(if ($failed.Count) { 'Failed' } else { 'Success' }) `
         -Detail ('{0} corrupt file(s) quarantined' -f ($bad.Count + [int]$badGpt)) `
         -Evidence $evidence
@@ -1048,12 +1090,28 @@ function Repair-MDWmiReset {
     Write-MDDetail -Text 'confirming the repository is actually corrupt before considering a reset' -Bullet '- '
     $check     = Invoke-MDProcess -FilePath $winmgmt -ArgumentList @('/verifyrepository') -TimeoutSeconds 180
     $checkText = (($check.StdOut + ' ' + $check.StdErr)).Trim()
-    $consistent = ($check.ExitCode -eq 0 -and $checkText -match '(?i)consistent' -and -not $check.TimedOut)
+    # Exit code only, for the same localization reason as everywhere else - and
+    # here the direction of the change matters: on a non-English install the
+    # old text match failed, "consistent" came out false, and this gate let a
+    # destructive reset proceed against a healthy repository. Trusting the exit
+    # code refuses instead.
+    $consistent = ($check.ExitCode -eq 0 -and -not $check.TimedOut)
 
     if ($checkText -match '0x80041003' -or $checkText -match '(?i)access denied') {
         return New-MDRepairResult -Id $id -Name $name -Status 'Skipped' `
             -Detail 'cannot confirm repository corruption without elevation' `
             -Evidence @($checkText, 'Re-run via mecmdoctor.bat. This action will not reset a repository it has not been able to verify.')
+    }
+
+    # Process.Start threw, so winmgmt never ran and the repository was never
+    # verified. "Unverified" must never fall through to "therefore corrupt" on
+    # the one code path that can reset it.
+    if ($check.ExitCode -eq -1 -and -not $check.StdOut) {
+        return New-MDRepairResult -Id $id -Name $name -Status 'Skipped' `
+            -Detail 'winmgmt.exe could not be launched, so corruption could not be confirmed' `
+            -Evidence @($check.StdErr,
+                        'Application control (AppLocker/WDAC) or endpoint security may be blocking it.',
+                        'This action will not reset a repository it has not been able to verify.')
     }
 
     if ($consistent) {
@@ -1108,7 +1166,7 @@ function Repair-MDWmiReset {
 
     [void](Start-MDServiceSafely -Name 'CcmExec')
 
-    $nowConsistent = ($verify.ExitCode -eq 0 -and $verifyText -match '(?i)consistent')
+    $nowConsistent = ($verify.ExitCode -eq 0)
 
     New-MDRepairResult -Id $id -Name $name -Status $(if ($nowConsistent) { 'Success' } else { 'Failed' }) `
         -Detail $(if ($nowConsistent) { 'repository rebuilt and consistent' } else { 'repository is still not consistent' }) `
@@ -1356,6 +1414,12 @@ function Repair-MDClientReinstall {
             Write-MDLine ('  output of {0}' -f (Split-Path -Leaf $custom)) -Color 'DarkGray'
             Write-MDRule '.' 'DarkGray'
 
+            # Cleared first: $LASTEXITCODE is session-wide and sticky. A custom
+            # script that simply falls off the end without an explicit "exit"
+            # leaves whatever the last native command in this session set, and
+            # a perfectly successful reinstall then reports as Failed.
+            $global:LASTEXITCODE = 0
+
             # Stream the script's output into our transcript so the reinstall
             # is recorded alongside everything else.
             & $custom @splat 2>&1 | ForEach-Object {
@@ -1372,7 +1436,7 @@ function Repair-MDClientReinstall {
 
             return New-MDRepairResult -Id $id -Name 'Reinstall the Configuration Manager client' -Status 'Success' `
                 -Detail ('custom script {0} completed' -f (Split-Path -Leaf $custom)) `
-                -Evidence @('Follow the install in C:\Windows\ccmsetup\Logs\ccmsetup.log; a full install takes 10-30 minutes.') `
+                -Evidence @(('Follow the install in {0}\ccmsetup\Logs\ccmsetup.log; a full install takes 10-30 minutes.' -f $env:windir)) `
                 -RebootRecommended
         }
         catch {
@@ -1440,7 +1504,7 @@ function Repair-MDClientReinstall {
 
     New-MDRepairResult -Id $id -Name 'Reinstall the Configuration Manager client' -Status 'Success' `
         -Detail 'uninstall completed and the reinstall has been launched' `
-        -Evidence ($evidence + 'ccmsetup continues in the background. Follow C:\Windows\ccmsetup\Logs\ccmsetup.log until it reports exit code 0.') `
+        -Evidence ($evidence + ('ccmsetup continues in the background. Follow {0}\ccmsetup\Logs\ccmsetup.log until it reports exit code 0.' -f $env:windir)) `
         -RebootRecommended
 }
 
@@ -1531,6 +1595,17 @@ function Get-MDRepairPlan {
     # Sort with a scriptblock, not a property name: the catalogue entries are
     # hashtables, and Sort-Object cannot see a hashtable key as a property.
     if ($Only -and $Only.Count -gt 0) {
+        # An unrecognised id has to be an error, not an empty plan. Silently
+        # selecting nothing makes "mecmdoctor repair -Only wmi.slavage" print
+        # "Nothing to repair at this tier", which an operator reasonably reads
+        # as "the machine is fine".
+        $knownIds = @($script:MDRepairCatalog | ForEach-Object { $_.Id })
+        $unknown  = @($Only | Where-Object { $knownIds -notcontains $_ })
+        if ($unknown.Count -gt 0) {
+            throw ("Unknown repair action id(s): {0}. Valid ids: {1}" -f
+                   ($unknown -join ', '), (($knownIds | Sort-Object) -join ', '))
+        }
+
         foreach ($entry in $script:MDRepairCatalog) {
             if ($Only -contains $entry.Id) { $plan += $entry }
         }

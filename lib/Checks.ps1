@@ -200,7 +200,7 @@ function Test-MDPrerequisites {
     if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) {
         $findings += New-MDFinding -Category 'Prerequisites' -Title 'Process architecture' -Status 'Warn' `
             -Detail '32-bit PowerShell on a 64-bit OS' `
-            -Remediation 'Re-run from C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe so registry and file system redirection do not hide the real state.'
+            -Remediation ('Re-run from {0}\System32\WindowsPowerShell\v1.0\powershell.exe so registry and file system redirection do not hide the real state.' -f $env:windir)
     }
     else {
         $findings += New-MDFinding -Category 'Prerequisites' -Title 'Process architecture' -Status 'Pass' `
@@ -254,7 +254,8 @@ function Test-MDClientInstall {
     if ($ccmsetupProc.Count -gt 0) {
         $findings += New-MDFinding -Category 'Client' -Title 'ccmsetup running' -Status 'Warn' `
             -Detail 'a client install or upgrade is in progress right now' `
-            -Remediation 'Wait for ccmsetup to finish before running any repair. Watch C:\Windows\ccmsetup\Logs\ccmsetup.log.'
+            -Evidence @('mecmdoctor refuses to repair while this is running, with or without -Force.') `
+            -Remediation ('Wait for ccmsetup to finish before running any repair. Watch {0}\ccmsetup\Logs\ccmsetup.log.' -f $env:windir)
     }
 
     if ($ClientInfo.LogPath -and (Test-Path -LiteralPath $ClientInfo.LogPath)) {
@@ -587,8 +588,26 @@ function Test-MDWmiHealth {
             -Remediation 'WMI is hung. Restart the Winmgmt service, then re-run. If it hangs again, reboot before repairing.' `
             -RepairIds @($script:MDRepairIds.WmiSalvage) -Severity 4
     }
-    elseif ($verify.ExitCode -eq 0 -and $verifyText -match '(?i)consistent') {
-        $findings += New-MDFinding -Category 'WMI' -Title 'Repository consistency' -Status 'Pass' -Detail 'repository is consistent'
+    elseif ($verify.ExitCode -eq 0) {
+        # The exit code is the authority, not the text. winmgmt prints its
+        # verdict in the display language of the machine, so requiring the word
+        # "consistent" would fail every non-English install and report a
+        # perfectly healthy repository as corrupt. The text is kept as
+        # evidence, which is all it was ever good for.
+        $findings += New-MDFinding -Category 'WMI' -Title 'Repository consistency' -Status 'Pass' `
+            -Detail 'repository is consistent' -Evidence @($verifyText)
+    }
+    elseif ($verify.ExitCode -eq -1 -and -not $verify.StdOut) {
+        # Invoke-MDProcess returns -1 when Process.Start itself threw, which is
+        # "I could not run winmgmt.exe" and says nothing about the repository.
+        # AppLocker, WDAC and EDR all produce this, and rendering it as
+        # corruption would be a fleet-wide false positive on exactly the kind
+        # of managed estate this tool is meant for.
+        $findings += New-MDFinding -Category 'WMI' -Title 'Repository consistency' -Status 'Skip' `
+            -Detail 'winmgmt.exe could not be launched' `
+            -Evidence @($verify.StdErr,
+                        'Application control (AppLocker/WDAC) or endpoint security may be blocking it.',
+                        'The repository state is unknown, so no repair is proposed on this evidence.')
     }
     elseif ($verifyText -match '0x80041003' -or $verifyText -match '(?i)access denied') {
         # Not a repository problem: verifyrepository simply refuses to answer
@@ -676,21 +695,27 @@ function Test-MDWmiHealth {
     # client's own. Both come out of the message body.
     $noiseThreshold = 25
     try {
-        $wmiEvents = @(Get-WinEvent -FilterHashtable @{
-                            LogName   = 'Microsoft-Windows-WMI-Activity/Operational'
-                            Level     = 2
-                            StartTime = (Get-Date).AddDays(-3)
-                        } -MaxEvents 200 -ErrorAction Stop)
+        $wmiLog = Get-MDWinEvent -MaxEvents 200 -FilterHashtable @{
+                        LogName   = 'Microsoft-Windows-WMI-Activity/Operational'
+                        Level     = 2
+                        StartTime = (Get-Date).AddDays(-3)
+                    }
+        if (-not $wmiLog.Available) { throw $wmiLog.Reason }
+        $wmiEvents = @($wmiLog.Events)
 
         if ($wmiEvents.Count -eq 0) {
             $findings += New-MDFinding -Category 'WMI' -Title 'Provider errors (last 3 days)' -Status 'Pass' -Detail 'none'
         }
         else {
+            # Read each event once, from its unlocalized UserData rather than
+            # its rendered message, and keep the detail for both the code
+            # grouping and the root\ccm test below.
+            $wmiDetails = @($wmiEvents | ForEach-Object { Get-MDWmiActivityDetail -Event $_ })
+
             # Group by result code so the evidence names the actual fault.
-            $codes = $wmiEvents |
-                ForEach-Object {
-                    if ($_.Message -match 'ResultCode\s*=\s*(0x[0-9A-Fa-f]+)') { $Matches[1] } else { 'no result code' }
-                } | Group-Object | Sort-Object Count -Descending | Select-Object -First 4
+            $codes = $wmiDetails |
+                ForEach-Object { $_.ResultCode } |
+                Group-Object | Sort-Object Count -Descending | Select-Object -First 4
 
             # The @() is load-bearing. A machine whose WMI errors all share one
             # result code makes this foreach yield a single string, and both the
@@ -708,7 +733,10 @@ function Test-MDWmiHealth {
 
             # Failures against a root\ccm namespace are the ones that actually
             # implicate the client rather than some unrelated agent.
-            $ccmRelated = @($wmiEvents | Where-Object { $_.Message -match 'root\\ccm' })
+            # The namespace is data rather than chrome, so it reads the same in
+            # every locale - but it is only reliably present in the operation
+            # text, which is why that is what gets searched.
+            $ccmRelated = @($wmiDetails | Where-Object { $_.Operation -match '(?i)root\\ccm' })
             if ($ccmRelated.Count -gt 0) {
                 $evidence += ('{0} of these involve a root\ccm namespace - the Configuration Manager client is directly affected.' -f $ccmRelated.Count)
             }
@@ -741,9 +769,10 @@ function Test-MDWmiHealth {
         }
     }
     catch {
-        # The operational log is disabled by default on some builds.
+        # The operational log is disabled by default on some builds. A clean
+        # three days is the Pass above, not this.
         $findings += New-MDFinding -Category 'WMI' -Title 'Provider errors (last 3 days)' -Status 'Skip' `
-            -Detail 'WMI-Activity/Operational log unavailable or unreadable'
+            -Detail 'WMI-Activity/Operational log unavailable or unreadable' -Evidence @("$_")
     }
 
     # --- repository size ----------------------------------------------------
@@ -969,10 +998,26 @@ function Test-MDManagementPointHttp {
 
     $findings = @()
 
-    # Modern sites are TLS 1.2+; PS 5.1 still defaults to SSL3/TLS1.0.
+    # Modern sites are TLS 1.2+, and older PowerShell 5.1 builds still default
+    # to SSL3/TLS1.0. This used to assign Tls12|Tls11|Tls outright, which had
+    # two problems: it dropped TLS 1.3 where the platform offers it, and it
+    # switched TLS 1.0/1.1 back on for a machine whose SCHANNEL configuration
+    # deliberately disables them - offering a protocol the administrator turned
+    # off, to gain nothing.
     try {
-        [Net.ServicePointManager]::SecurityProtocol =
-            [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls
+        $current = [Net.ServicePointManager]::SecurityProtocol
+
+        # SystemDefault means "let Schannel negotiate", which on a supported
+        # Windows build already prefers 1.2/1.3 and already honours whatever
+        # the administrator disabled. Overriding that can only narrow it.
+        if ($current -ne [Net.SecurityProtocolType]::SystemDefault) {
+            $wanted = $current -bor [Net.SecurityProtocolType]::Tls12
+
+            # Tls13 is absent from older .NET Framework, and present but not
+            # accepted by Schannel on some builds. 1.2 is the floor either way.
+            try   { [Net.ServicePointManager]::SecurityProtocol = $wanted -bor [Net.SecurityProtocolType]::Tls13 }
+            catch { [Net.ServicePointManager]::SecurityProtocol = $wanted }
+        }
     } catch { }
 
     $schemes = @('http')
@@ -1918,9 +1963,22 @@ function Test-MDGroupPolicy {
         $file = Get-Item -LiteralPath $p.Path -Force
         $verdict = Test-MDRegistryPolIntegrity -Path $p.Path
 
-        if ($verdict.Valid) {
+        if ($verdict.Valid -eq $true) {
             $findings += New-MDFinding -Category 'GroupPolicy' -Title ('Registry.pol (' + $p.Scope + ')') -Status 'Pass' `
                 -Detail ('valid, {0}, modified {1}' -f (Format-MDBytes $file.Length), (Format-MDAge $file.LastWriteTime))
+        }
+        elseif ($null -eq $verdict.Valid) {
+            # Unverified is not corrupt. No repair id, so nothing downstream can
+            # decide to quarantine a file whose contents we never actually saw.
+            $findings += New-MDFinding -Category 'GroupPolicy' -Title ('Registry.pol (' + $p.Scope + ')') -Status 'Warn' `
+                -Detail ('could not be verified - {0}' -f $verdict.Reason) `
+                -Evidence @(
+                    $p.Path
+                    ('size {0}, modified {1}' -f (Format-MDBytes $file.Length), $file.LastWriteTime)
+                    'Usually gpsvc holding the file open mid-write, which clears on its own. The file is not being called corrupt and nothing will be done to it.'
+                ) `
+                -Remediation 'Re-run the diagnosis in a minute or two. If it still cannot be read, check the ACL on the GroupPolicy folder.' `
+                -Severity 1
         }
         else {
             $corrupt += $p.Path
@@ -1981,11 +2039,13 @@ function Test-MDGroupPolicy {
     #   7016/7017 - a CSE reported a fatal processing error
     $gpEventIds = @(1096, 1058, 1053, 7016, 7017, 1085)
     try {
-        $gpEvents = @(Get-WinEvent -FilterHashtable @{
-                          LogName   = 'Microsoft-Windows-GroupPolicy/Operational'
-                          Id        = $gpEventIds
-                          StartTime = (Get-Date).AddDays(-14)
-                      } -MaxEvents 50 -ErrorAction Stop)
+        $gpLog = Get-MDWinEvent -MaxEvents 50 -FilterHashtable @{
+                      LogName   = 'Microsoft-Windows-GroupPolicy/Operational'
+                      Id        = $gpEventIds
+                      StartTime = (Get-Date).AddDays(-14)
+                  }
+        if (-not $gpLog.Available) { throw $gpLog.Reason }
+        $gpEvents = @($gpLog.Events)
 
         if ($gpEvents.Count -gt 0) {
             $byId = $gpEvents | Group-Object Id | Sort-Object Count -Descending
@@ -2010,16 +2070,20 @@ function Test-MDGroupPolicy {
         }
     }
     catch {
+        # Only a genuine read failure lands here now. "No errors in 14 days" is
+        # the Pass above, which is where it always belonged.
         $findings += New-MDFinding -Category 'GroupPolicy' -Title 'Group Policy errors (14 days)' -Status 'Skip' `
-            -Detail 'GroupPolicy/Operational log unavailable'
+            -Detail 'GroupPolicy/Operational log could not be read' -Evidence @("$_")
     }
 
     # --- last successful processing ----------------------------------------
     try {
-        $ok = Get-WinEvent -FilterHashtable @{
-                  LogName = 'Microsoft-Windows-GroupPolicy/Operational'
-                  Id      = 8004    # machine policy processing succeeded
-              } -MaxEvents 1 -ErrorAction Stop
+        $okLog = Get-MDWinEvent -MaxEvents 1 -FilterHashtable @{
+                      LogName = 'Microsoft-Windows-GroupPolicy/Operational'
+                      Id      = 8004    # machine policy processing succeeded
+                  }
+        if (-not $okLog.Available) { throw $okLog.Reason }
+        $ok = @($okLog.Events) | Select-Object -First 1
 
         if ($ok) {
             $age    = (Get-Date) - $ok.TimeCreated
@@ -2028,10 +2092,19 @@ function Test-MDGroupPolicy {
                 -Detail (Format-MDAge $ok.TimeCreated) `
                 -Remediation $(if ($status -eq 'Warn') { 'Run gpupdate /force, or let mecmdoctor repair -Level Safe do it, then confirm the machine can reach a domain controller.' } else { '' })
         }
+        else {
+            # Reachable now that "no matching events" is not swallowed as a
+            # read failure - and worth saying, because event 8004 is written
+            # every single time machine policy applies cleanly.
+            $findings += New-MDFinding -Category 'GroupPolicy' -Title 'Last successful machine policy' -Status 'Warn' `
+                -Detail 'the log records no successful machine policy processing at all' `
+                -Evidence @('Either the log was cleared recently, or machine policy has never applied successfully on this machine.') `
+                -Remediation 'Run gpupdate /force, then confirm the machine can reach a domain controller.' -Severity 2
+        }
     }
     catch {
         $findings += New-MDFinding -Category 'GroupPolicy' -Title 'Last successful machine policy' -Status 'Skip' `
-            -Detail 'no processing events available'
+            -Detail 'GroupPolicy/Operational log could not be read' -Evidence @("$_")
     }
 
     $findings | Write-MDFinding
@@ -2043,8 +2116,22 @@ function Test-MDRegistryPolIntegrity {
 <#
     .SYNOPSIS
         Validates the binary header of a Registry.pol file.
+    .DESCRIPTION
+        The verdict is deliberately three-state, because "this file is corrupt"
+        and "I could not read this file" are different claims and only one of
+        them justifies deleting a file full of applied machine policy:
+
+            Valid = $true    header checks out
+            Valid = $false   proven corrupt - the bytes were read and are wrong
+            Valid = $null    could not be verified - a sharing violation, an
+                             ACL, a file that vanished mid-check
+
+        gpsvc holds Registry.pol while it writes, and this tool runs gpupdate
+        in several nearby paths, so $null is a routine outcome rather than an
+        exotic one. Anything that acts on this verdict must test for $false
+        explicitly and never treat "not true" as "corrupt".
     .OUTPUTS
-        [pscustomobject] Valid / Reason
+        [pscustomobject] Valid ($true/$false/$null) / Reason
 #>
     param([Parameter(Mandatory)][string] $Path)
 
@@ -2058,9 +2145,21 @@ function Test-MDRegistryPolIntegrity {
             return [pscustomobject]@{ Valid = $false; Reason = ('file is only {0} bytes - too short to contain a valid header' -f $file.Length) }
         }
 
+        # FileShare::ReadWrite, the same way Get-MDLogTail opens a live CCM
+        # log. [System.IO.File]::OpenRead asks for FileShare.Read, which loses
+        # to a gpsvc that currently has the file open for writing - and losing
+        # there used to read as corruption.
         $header = New-Object byte[] 8
-        $fs = [System.IO.File]::OpenRead($Path)
-        try { [void]$fs.Read($header, 0, 8) } finally { $fs.Dispose() }
+        $read   = 0
+        $fs = New-Object System.IO.FileStream($Path,
+                    [System.IO.FileMode]::Open,
+                    [System.IO.FileAccess]::Read,
+                    [System.IO.FileShare]::ReadWrite)
+        try { $read = $fs.Read($header, 0, 8) } finally { $fs.Dispose() }
+
+        if ($read -lt 8) {
+            return [pscustomobject]@{ Valid = $null; Reason = ('only {0} of 8 header bytes could be read' -f $read) }
+        }
 
         # "PReg" = 0x50 0x52 0x65 0x67, then a UInt32 version of 1.
         $signature = [System.Text.Encoding]::ASCII.GetString($header, 0, 4)
@@ -2076,7 +2175,9 @@ function Test-MDRegistryPolIntegrity {
         return [pscustomobject]@{ Valid = $true; Reason = 'header is valid' }
     }
     catch {
-        return [pscustomobject]@{ Valid = $false; Reason = ('could not be read: {0}' -f $_.Exception.Message) }
+        # Unreadable, not corrupt. Saying otherwise here is what would get a
+        # healthy policy file deleted.
+        return [pscustomobject]@{ Valid = $null; Reason = ('could not be read: {0}' -f $_.Exception.Message) }
     }
 }
 
@@ -2186,13 +2287,29 @@ function Test-MDSystemHealth {
     # The client needs headroom for the cache, the WU datastore and servicing.
     $drives = @($env:SystemDrive)
     if ($ClientInfo.CacheLocation) {
-        $cacheDrive = [System.IO.Path]::GetPathRoot($ClientInfo.CacheLocation).TrimEnd('\')
-        if ($cacheDrive -and $drives -notcontains $cacheDrive) { $drives += $cacheDrive }
+        # Win32_Volume rather than GetPathRoot, because a cache on a mount
+        # point (C:\Mounts\Cache) has a path root of C:\ - so the old code
+        # measured free space on the host drive and never once looked at the
+        # volume the cache is actually filling up.
+        $cacheVolume = Get-MDVolumeForPath -Path $ClientInfo.CacheLocation
+        if ($cacheVolume -and $drives -notcontains $cacheVolume) { $drives += $cacheVolume }
     }
 
     foreach ($d in $drives) {
         try {
-            $vol = Get-CimInstance -ClassName Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f $d) -ErrorAction Stop
+            # A drive letter comes back from Win32_LogicalDisk; a mount point
+            # path only exists in Win32_Volume, which is keyed on Name and
+            # carries the same Size/FreeSpace properties.
+            $vol = $null
+            if ($d -match '^[A-Za-z]:$') {
+                $vol = Get-CimInstance -ClassName Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f $d) -ErrorAction Stop
+            }
+            if (-not $vol) {
+                # String.Replace, not -replace: WQL wants each backslash
+                # doubled, and the regex form of that reads as a puzzle.
+                $escaped = ($d.TrimEnd('\') + '\').Replace('\', '\')
+                $vol = Get-CimInstance -ClassName Win32_Volume -Filter ("Name='{0}'" -f $escaped) -ErrorAction Stop
+            }
             if (-not $vol) { continue }
 
             $freePct = 0
@@ -2227,35 +2344,67 @@ function Test-MDSystemHealth {
     # Clock skew breaks Kerberos and certificate validation, which then shows
     # up as a certificate error three layers away from the real cause.
     try {
+        $isDomainMember = $false
+        try { $isDomainMember = (Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop).PartOfDomain } catch { }
+
+        # The verdict comes from the registry, not from parsing w32tm's output.
+        # That output is localized: on a German or French install the "Source:"
+        # regex below matches nothing, and this check used to render that as
+        # "[ OK ] source , last sync " - a Pass with two empty fields, which is
+        # both wrong and looks broken.
+        #
+        #   NT5DS   - domain hierarchy, which is what a domain member wants
+        #   NTP     - explicit peers, listed in NtpServer
+        #   AllSync - both
+        #   NoSync  - not synchronising at all
+        $w32Params = 'HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\Parameters'
+        $syncType  = Get-MDRegValue -Path $w32Params -Name 'Type'
+        $ntpPeers  = Get-MDRegValue -Path $w32Params -Name 'NtpServer'
+
         $w32 = Invoke-MDProcess -FilePath (Join-Path $env:windir 'System32\w32tm.exe') `
                                 -ArgumentList @('/query', '/status') -TimeoutSeconds 30
+
+        # Decoration only now. An English machine gets a friendlier line; every
+        # other machine reaches the same verdict without it.
+        $source   = ''
+        $lastSync = ''
         if ($w32.ExitCode -eq 0) {
-            $source   = ''
-            $lastSync = ''
-            if ($w32.StdOut -match '(?im)^\s*Source:\s*(.+)$')            { $source   = $Matches[1].Trim() }
+            if ($w32.StdOut -match '(?im)^\s*Source:\s*(.+)$')                    { $source   = $Matches[1].Trim() }
             if ($w32.StdOut -match '(?im)^\s*Last Successful Sync Time:\s*(.+)$') { $lastSync = $Matches[1].Trim() }
-
-            $isDomainMember = $false
-            try { $isDomainMember = (Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop).PartOfDomain } catch { }
-
-            if ($isDomainMember -and $source -match '(?i)Local CMOS Clock|Free-running') {
-                $findings += New-MDFinding -Category 'System' -Title 'Time synchronisation' -Status 'Warn' `
-                    -Detail ('domain member syncing from "{0}"' -f $source) `
-                    -Evidence @("Last successful sync: $lastSync",
-                                'Clock skew beyond five minutes breaks Kerberos and makes valid certificates look expired.') `
-                    -Remediation 'Run: w32tm /config /syncfromflags:domhier /update  then  w32tm /resync'
-            }
-            else {
-                $findings += New-MDFinding -Category 'System' -Title 'Time synchronisation' -Status 'Pass' `
-                    -Detail ('source {0}, last sync {1}' -f $source, $lastSync)
-            }
         }
-        else {
+
+        $sourceText = $source
+        if (-not $sourceText -and $syncType) { $sourceText = ('W32Time type {0}' -f $syncType) }
+        if (-not $sourceText)                { $sourceText = 'could not be determined' }
+
+        $lastSyncText = if ($lastSync) { $lastSync } else { 'not reported' }
+
+        $notSyncing = (($syncType -and "$syncType" -ieq 'NoSync') -or
+                       ($source -match '(?i)Local CMOS Clock|Free-running'))
+
+        if (-not $syncType -and $w32.ExitCode -ne 0) {
             # w32tm exits non-zero when the Windows Time service is stopped,
             # which is normal on a workgroup machine - keep the reason visible.
             $findings += New-MDFinding -Category 'System' -Title 'Time synchronisation' -Status 'Skip' `
-                -Detail ('w32tm /query /status exited with {0}' -f $w32.ExitCode) `
+                -Detail ('w32tm /query /status exited with {0}, and W32Time has no configured sync type' -f $w32.ExitCode) `
                 -Evidence @((($w32.StdOut + ' ' + $w32.StdErr)).Trim())
+        }
+        elseif ($isDomainMember -and $notSyncing) {
+            $findings += New-MDFinding -Category 'System' -Title 'Time synchronisation' -Status 'Warn' `
+                -Detail ('domain member is not syncing from the domain ({0})' -f $sourceText) `
+                -Evidence @(("Last successful sync: {0}" -f $lastSyncText),
+                            ("W32Time Type: {0}" -f $(if ($syncType) { $syncType } else { 'not set' })),
+                            'Clock skew beyond five minutes breaks Kerberos and makes valid certificates look expired.') `
+                -Remediation 'Run: w32tm /config /syncfromflags:domhier /update  then  w32tm /resync'
+        }
+        else {
+            $timeEvidence = @()
+            if ($syncType) { $timeEvidence += ('W32Time Type: {0}' -f $syncType) }
+            if ($ntpPeers) { $timeEvidence += ('NtpServer: {0}' -f $ntpPeers) }
+
+            $findings += New-MDFinding -Category 'System' -Title 'Time synchronisation' -Status 'Pass' `
+                -Detail ('source {0}, last sync {1}' -f $sourceText, $lastSyncText) `
+                -Evidence $timeEvidence
         }
     }
     catch {

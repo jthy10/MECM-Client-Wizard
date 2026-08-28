@@ -29,17 +29,19 @@
 # Initialize-MDConsole can reconfigure the whole engine in a single place.
 # ---------------------------------------------------------------------------
 $script:MDLog = @{
-    Started     = (Get-Date)
-    PlainPath   = $null      # full path to the human-readable transcript
-    CMTracePath = $null      # full path to the CMTrace-formatted transcript
-    UseColor    = $true      # cleared by -NoColor, or when there is no real console
-    Quiet       = $false     # suppress routine console chatter (files still written)
-    Debug       = $false     # also show [ .. ] diagnostic lines on screen
-    Width       = 100        # render width, clamped to the real window when readable
-    StepIndex   = 0          # current step number, drives the "[ 3/14]" prefix
-    StepTotal   = 0          # total steps in the current phase
-    Failures    = 0          # running counters, consumed by the exit-code logic
-    Warnings    = 0
+    Started       = (Get-Date)
+    PlainPath     = $null    # full path to the human-readable transcript
+    CMTracePath   = $null    # full path to the CMTrace-formatted transcript
+    PlainWriter   = $null    # held-open StreamWriter for PlainPath
+    CMTraceWriter = $null    # held-open StreamWriter for CMTracePath
+    UseColor      = $true    # cleared by -NoColor, or when there is no real console
+    Quiet         = $false   # suppress routine console chatter (files still written)
+    Debug         = $false   # also show [ .. ] diagnostic lines on screen
+    Width         = 100      # render width, clamped to the real window when readable
+    StepIndex     = 0        # current step number, drives the "[ 3/14]" prefix
+    StepTotal     = 0        # total steps in the current phase
+    Failures      = 0        # running counters, consumed by the exit-code logic
+    Warnings      = 0
 }
 
 # Fixed-width status tags. Keeping every tag the same length is what makes the
@@ -118,6 +120,47 @@ function Test-MDMenuCapable {
 }
 
 
+function New-MDTranscriptWriter {
+<#
+    .SYNOPSIS
+        A truncating UTF-8 StreamWriter over one transcript file.
+    .DESCRIPTION
+        FileShare::ReadWrite so anything else - CMTrace, a tail, the support
+        bundle copying its own transcript in mid-run - can read the file while
+        it is being written. AutoFlush so an aborted run still leaves every
+        line that was reported on screen.
+#>
+    param([Parameter(Mandatory)][string] $Path)
+
+    $stream = New-Object System.IO.FileStream($Path,
+                    [System.IO.FileMode]::Create,
+                    [System.IO.FileAccess]::Write,
+                    [System.IO.FileShare]::ReadWrite)
+
+    # UTF8Encoding($false): no BOM, matching what Set-Content produced here
+    # before and keeping the transcripts plain for anything that greps them.
+    $writer = New-Object System.IO.StreamWriter($stream, (New-Object System.Text.UTF8Encoding($false)))
+    $writer.AutoFlush = $true
+    $writer
+}
+
+
+function Close-MDTranscripts {
+    <#
+        Closes both transcript writers if they are open. Safe to call at any
+        time, including when nothing was ever opened.
+    #>
+    foreach ($key in @('PlainWriter', 'CMTraceWriter')) {
+        $writer = $script:MDLog[$key]
+        if ($writer) {
+            try { $writer.Flush() }   catch { }
+            try { $writer.Dispose() } catch { }
+        }
+        $script:MDLog[$key] = $null
+    }
+}
+
+
 function Initialize-MDConsole {
 <#
     .SYNOPSIS
@@ -150,6 +193,14 @@ function Initialize-MDConsole {
     # Forget the previous run's transcripts before deciding on this one's.
     # Without this, re-initialising without a log directory would leave the
     # engine still appending to a file the last run has already closed off.
+    # The writers are disposed here too - the menu re-initialises per command,
+    # and leaking a file handle per command would keep the previous run's
+    # transcript locked for the rest of the session.
+    #
+    # Deliberately here and not in Write-MDFooter: anything printed after the
+    # footer still belongs in the transcript that is open, exactly as it did
+    # when every line reopened the file for itself.
+    Close-MDTranscripts
     $script:MDLog.PlainPath   = $null
     $script:MDLog.CMTracePath = $null
     $script:MDLog.StepIndex   = 0
@@ -184,14 +235,27 @@ function Initialize-MDConsole {
             $script:MDLog.PlainPath   = Join-Path $LogDirectory ($base + '.log')
             $script:MDLog.CMTracePath = Join-Path $LogDirectory ($base + '.cmtrace.log')
 
-            # Touch both files now, so a permissions problem shows up immediately
-            # rather than silently swallowing the whole transcript.
+            # Opened once and held. Add-Content per line opened, wrote and
+            # closed both files for every line of output - several thousand
+            # open/close pairs on a full diagnose, each one an on-access scan
+            # for whatever endpoint protection is watching. On the slow,
+            # unhealthy machines this tool is pointed at, that was a
+            # meaningful share of the runtime for no benefit at all.
+            #
+            # AutoFlush so a crash still leaves a complete transcript, and
+            # FileShare::ReadWrite so CMTrace, a tail, or the bundle's own
+            # Copy-Item can read the file while the run is still writing it.
+            $script:MDLog.PlainWriter   = New-MDTranscriptWriter -Path $script:MDLog.PlainPath
+            $script:MDLog.CMTraceWriter = New-MDTranscriptWriter -Path $script:MDLog.CMTracePath
+
+            # Written through the writer, so a permissions problem shows up
+            # here rather than silently swallowing the whole transcript.
             $header = 'MECM Client Wizard transcript - started ' + $script:MDLog.Started.ToString('yyyy-MM-dd HH:mm:ss')
-            Set-Content -LiteralPath $script:MDLog.PlainPath   -Value $header -Encoding UTF8 -ErrorAction Stop
-            Set-Content -LiteralPath $script:MDLog.CMTracePath -Value ''      -Encoding UTF8 -ErrorAction Stop
+            $script:MDLog.PlainWriter.WriteLine($header)
         }
         catch {
             # Losing the transcript is survivable; losing the run is not.
+            Close-MDTranscripts
             $script:MDLog.PlainPath   = $null
             $script:MDLog.CMTracePath = $null
             Write-Warning ("Could not open log files in '{0}': {1}" -f $LogDirectory, $_.Exception.Message)
@@ -245,15 +309,19 @@ function Write-MDLine {
     if ($NoFile) { return }
 
     # ---- plain transcript --------------------------------------------------
-    if ($script:MDLog.PlainPath) {
+    if ($script:MDLog.PlainWriter) {
         try {
+            # The extra parentheses are load-bearing: inside a method call the
+            # comma is an argument separator, so WriteLine('{0} {1}' -f $ts,
+            # $Text) binds as WriteLine(('{0} {1}' -f $ts), $Text) and throws
+            # a FormatException that the catch below would silently eat.
             $ts = (Get-Date).ToString('HH:mm:ss')
-            Add-Content -LiteralPath $script:MDLog.PlainPath -Value ('{0}  {1}' -f $ts, $Text) -Encoding UTF8 -ErrorAction Stop
+            $script:MDLog.PlainWriter.WriteLine(('{0}  {1}' -f $ts, $Text))
         } catch { }
     }
 
     # ---- CMTrace transcript ------------------------------------------------
-    if ($script:MDLog.CMTracePath) {
+    if ($script:MDLog.CMTraceWriter) {
         try {
             $now = Get-Date
             # CMTrace wants the UTC offset in signed minutes, no colon.
@@ -272,7 +340,7 @@ function Write-MDLine {
                         $Severity,
                         [System.Threading.Thread]::CurrentThread.ManagedThreadId
 
-            Add-Content -LiteralPath $script:MDLog.CMTracePath -Value $entry -Encoding UTF8 -ErrorAction Stop
+            $script:MDLog.CMTraceWriter.WriteLine($entry)
         } catch { }
     }
 }

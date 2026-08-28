@@ -675,7 +675,7 @@ function Step-MDRepairTier {
     }
 
     $answer = Read-MDMenuChoice -Wrap -Default $default -Options @(
-        @{ Key = '1'; Label = 'Recommended'; Help = 'Let the diagnosis pick the lowest tier that covers what it found. This is what "mecmdoctor repair" does on its own.' }
+        @{ Key = '1'; Label = 'Recommended'; Help = 'Let the diagnosis pick the lowest tier that covers what it found. This is what "mecmdoctor repair" does on its own, and it never picks Aggressive - a destructive action is only ever reached by choosing it below.' }
         @{ Key = '2'; Label = 'Safe';        Help = 'Reversible only: start an implicated service, restart CcmExec, clear the cache and failed BITS jobs, trigger client cycles, run ccmeval. Fine on a production machine during the day.' }
         @{ Key = '3'; Label = 'Standard';    Help = 'Safe, plus rebuilding state that Windows regenerates by itself: salvage the WMI repository, quarantine a corrupt Registry.pol, purge and re-download policy, reset Windows Update, repair the client.' }
         @{ Key = '4'; Label = 'Aggressive';  Help = 'Everything above, plus destructive actions: reset the WMI repository, clear Group Policy state, rebuild the security database, reinstall the client.'; Color = 'Yellow' }
