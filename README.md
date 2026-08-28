@@ -9,7 +9,7 @@ repairs it wants to run and why — and then asks before it runs any of them.
 Run it with no arguments and you get a menu. Run it with a command and it goes straight there.
 
 ```
-mecmdoctor              the menu
+mecmdoctor the menu
 mecmdoctor diagnose
 mecmdoctor repair
 mecmdoctor bundle
